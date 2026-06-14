@@ -110,9 +110,23 @@ class NKIRenderer(Renderer):
     out_slot = out_index.src[0].arg.slot
     out_dtype = self._npname(next(p for p in params if p.arg.slot == out_slot).dtype)
     reduces = [u for u in uops if u.op is Ops.REDUCE]
-    if len(reduces) > 1: raise NotImplementedError("NKI: only single reduce supported")
-    red = reduces[0] if reduces else None
-    if red is not None and red.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {red.arg[0]}")
+    for rd in reduces:
+      if rd.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rd.arg[0]}")
+    # topological order: a reduce whose body contains another reduce is emitted later
+    def _has(u, target):
+      seen, stack = set(), [u]
+      while stack:
+        x = stack.pop()
+        if x in seen: continue
+        seen.add(x)
+        for s in x.src:
+          if s is target: return True
+          stack.append(s)
+      return False
+    ordered, rem = [], list(reduces)
+    while rem:
+      nxt = next((rd for rd in rem if not any(_has(rd.src[0], o) for o in rem if o is not rd)), rem[0])
+      ordered.append(nxt); rem.remove(nxt)
 
     # Each distinct input INDEX node is its own tile -- so the same buffer read with two access
     # patterns (e.g. a @ a.T) becomes two tiles. We pass a strided view per INDEX (the runtime
@@ -127,8 +141,8 @@ class NKIRenderer(Renderer):
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
     kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
-    canonical = kept_ranges + ([red.src[1]] if red is not None else [])
-    split = len(kept_ranges) if red is not None else max(0, len(kept_ranges) - 1)
+    canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
+    split = len(kept_ranges) if ordered else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
     inputs_meta = []
     for u in in_index:
@@ -142,15 +156,18 @@ class NKIRenderer(Renderer):
 
     ref = "t0"
     lines = [f"    t{i} = nl.load(in{i})" for i in range(len(in_index))]
+    reduce_vars:dict = {}
     def leaf(u):
-      if u is red: return "r"
+      if u in reduce_vars: return reduce_vars[u]
       if u in tid: return f"t{tid[u]}"
       return None
-    if red is not None:
-      lines.append(f"    r = {NL_REDUCE[red.arg[0]]}({self._emit(red.src[0], leaf, ref)}, axis=[1], keepdims=True)")
-      out_free = 1
-    else:
-      out_free = int(np.prod(csize[split:])) if split < len(csize) else 1
+    # each reduce's inputs are (P, R_k) tiles (their index spans reduce range R_k); reduce the
+    # trailing free axis -> (P,1). Independent reduces (e.g. attention numerator/denominator) are
+    # separate statements; nested ones are emitted inner-first via the topological order above.
+    for i, rd in enumerate(ordered):
+      lines.append(f"    r{i} = {NL_REDUCE[rd.arg[0]]}({self._emit(rd.src[0], leaf, ref)}, axis=[1], keepdims=True)")
+      reduce_vars[rd] = f"r{i}"
+    out_free = 1 if ordered else (int(np.prod(csize[split:])) if split < len(csize) else 1)
     final = self._emit(store.src[1], leaf, ref)
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
