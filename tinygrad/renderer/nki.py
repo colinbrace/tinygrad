@@ -97,6 +97,36 @@ class NKIRenderer(Renderer):
             "import nki\nimport nki.language as nl\n\n"
             f"@nki.jit\ndef kernel({sig}):\n" + "\n".join(lines) + "\n")
 
+  def _match_matmul(self, store, ordered, kept_ranges, out_slot, out_dtype):
+    # detect out[m,n] = sum_k a[m,k]*b[k,n] (a pure 2D sum-reduce of a product of two indexed inputs)
+    if len(ordered) != 1 or len(kept_ranges) != 2 or store.src[1] is not ordered[0]: return None
+    rd = ordered[0]
+    if rd.arg[0] is not Ops.ADD: return None
+    strip = lambda u: strip(u.src[0]) if u.op is Ops.CAST else u
+    body = strip(rd.src[0])
+    if body.op is not Ops.MUL: return None
+    xa, xb = strip(body.src[0]), strip(body.src[1])
+    if not all(x.op is Ops.INDEX and x.src[0].op is Ops.PARAM for x in (xa, xb)): return None
+    K, (Mr, Nr) = rd.src[1], kept_ranges
+    (ca, oa), (cb, ob) = _affine(xa.src[1]), _affine(xb.src[1])
+    # orient so A spans (rows Mr, K) and B spans (K, cols Nr); swap operands if needed
+    if Mr in cb and Nr in ca: (xa, ca, oa), (xb, cb, ob) = (xb, cb, ob), (xa, ca, oa)
+    if not (Mr in ca and K in ca and Nr in cb and K in cb): return None
+    Msz, Nsz, Ksz = _rsize(Mr), _rsize(Nr), _rsize(K)
+    if Msz > 128 or Ksz > 128 or Nsz > 512: return None     # exceeds nl.matmul tile limits -> generic path
+    # A is passed transposed as (K, M); nl.matmul(A, B, transpose_x=True) = A.T @ B = a @ b
+    meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "M":Msz, "N":Nsz, "K":Ksz,
+            "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":[ca[K], ca[Mr]], "offset":oa},
+            "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":[cb[K], cb[Nr]], "offset":ob}}
+    lines = ["    A = nl.load(in0)", "    B = nl.load(in1)",
+             "    p = nl.matmul(A, B, transpose_x=True)",
+             f"    res = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.sbuf)",
+             "    nisa.tensor_copy(res, p)",
+             f"    out = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+             "    nl.store(out, value=res)", "    return out"]
+    return (f"# TRAINIUM_META {json.dumps(meta)}\nimport nki\nimport nki.language as nl\nimport nki.isa as nisa\n\n"
+            "@nki.jit\ndef kernel(in0, in1):\n" + "\n".join(lines) + "\n")
+
   def render(self, uops:list[UOp]) -> str:
     if os.getenv("NKI_DUMP"):
       idx = {u:i for i,u in enumerate(uops)}
@@ -137,9 +167,13 @@ class NKIRenderer(Renderer):
         in_index.append(u)
     tid = {u:i for i,u in enumerate(in_index)}   # may be empty: a coord-only kernel (e.g. arange)
 
+    kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
+    # matmul fast path: a sum-reduce of a product of two inputs -> nl.matmul (real tile matmul,
+    # not the O(M*N*K) broadcast-materialize). Within NKI limits only; else fall through to generic.
+    if (mm := self._match_matmul(store, ordered, kept_ranges, out_slot, out_dtype)) is not None: return mm
+
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
-    kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
     canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
     split = len(kept_ranges) if ordered else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]

@@ -50,6 +50,15 @@ class TrainiumProgram:
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
+    if m.get("kind") == "matmul":   # nl.matmul fast path: build A as (K,M), B as (K,N) strided views
+      import nki
+      def view(spec, shape):
+        d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
+        return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
+          flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
+      out = np.asarray(nki.simulate(self.kernel)(view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))))
+      bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
+      return None
     # Build each input INDEX as a strided view over the canonical iteration space: full size on
     # PARTITION (kept) axes, natural size on FREE axes (1 where stride is 0). A 0 stride broadcasts,
     # a nonzero stride + offset reads contiguous/transpose/slice -- all uniformly. Then reshape (P, F).
