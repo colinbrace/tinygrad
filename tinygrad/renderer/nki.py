@@ -114,7 +114,6 @@ class NKIRenderer(Renderer):
     if Mr in cb and Nr in ca: (xa, ca, oa), (xb, cb, ob) = (xb, cb, ob), (xa, ca, oa)
     if not (Mr in ca and K in ca and Nr in cb and K in cb): return None
     Msz, Nsz, Ksz = _rsize(Mr), _rsize(Nr), _rsize(K)
-    if Msz > 128 or Ksz > 128 or Nsz > 512: return None     # exceeds nl.matmul tile limits -> generic path
     # post-reduce operands (bias etc.): every other indexed input, affine over the kept axes only, as (M,N)
     post = [u for u in in_index if u is not xa and u is not xb]
     post_meta = []
@@ -126,22 +125,35 @@ class NKIRenderer(Renderer):
                         "strides":[c.get(Mr, 0), c.get(Nr, 0)], "offset":o})
     tpost = {u:i for i,u in enumerate(post)}
     def leaf(u):
-      if u is rd: return "res"                               # the matmul result tile
+      if u is rd: return "res_s"                             # the (tile of the) matmul result
       if u in tpost: return f"t{tpost[u]}"
       return None
-    final = self._emit(store.src[1], leaf, "res")
-    # A is passed transposed as (K, M); nl.matmul(A, B, transpose_x=True) = A.T @ B = a @ b
+    final = self._emit(store.src[1], leaf, "res_s")
+    # A is passed transposed as (K, M), B as (K, N). nc_matmul(res, A_kt, B_k) computes A_kt.T @ B_k.
     meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "M":Msz, "N":Nsz, "K":Ksz,
             "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":[ca[K], ca[Mr]], "offset":oa},
             "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":[cb[K], cb[Nr]], "offset":ob},
             "post":post_meta}
-    lines = ["    A = nl.load(in0)", "    B = nl.load(in1)",
-             "    p = nl.matmul(A, B, transpose_x=True)",
-             f"    res = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.sbuf)",
-             "    nisa.tensor_copy(res, p)"]
-    lines += [f"    t{i} = nl.load(in{i+2})" for i in range(len(post))]
-    lines += [f"    out = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
-              f"    nl.store(out, value=nl.broadcast_to({final}, out.shape))", "    return out"]
+    # Tiled Tensor-Engine matmul: tile the output into <=128 (M) x <=512 (N) blocks; for each, accumulate
+    # the contraction over <=128-wide K-blocks into one PSUM tile (successive nc_matmul accumulate), copy
+    # to SBUF, apply elementwise post-ops, store. min(...) handles ragged (non-multiple) tail tiles.
+    i4, i8, i12, i16 = "    ", "        ", "            ", "                "
+    lines = [f"{i4}out = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+             f"{i4}for mi in range(0, {Msz}, 128):",
+             f"{i8}m1 = min(mi + 128, {Msz})",
+             f"{i8}for ni in range(0, {Nsz}, 512):",
+             f"{i12}n1 = min(ni + 512, {Nsz})",
+             f"{i12}res = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.float32, buffer=nl.psum)",
+             f"{i12}for ki in range(0, {Ksz}, 128):",
+             f"{i16}k1 = min(ki + 128, {Ksz})",
+             f"{i16}a_t = nl.load(in0[ki:k1, mi:m1])",
+             f"{i16}b_t = nl.load(in1[ki:k1, ni:n1])",
+             f"{i16}nisa.nc_matmul(res, a_t, b_t)",
+             f"{i12}res_s = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.{out_dtype}, buffer=nl.sbuf)",
+             f"{i12}nisa.tensor_copy(res_s, res)"]
+    lines += [f"{i12}t{i} = nl.load(in{i+2}[mi:m1, ni:n1])" for i in range(len(post))]
+    lines += [f"{i12}nl.store(out[mi:m1, ni:n1], value=nl.broadcast_to({final}, res_s.shape))",
+              f"{i4}return out"]
     sig = ", ".join(["in0", "in1"] + [f"in{i+2}" for i in range(len(post))])
     return (f"# TRAINIUM_META {json.dumps(meta)}\nimport nki\nimport nki.language as nl\nimport nki.isa as nisa\n\n"
             f"@nki.jit\ndef kernel({sig}):\n" + "\n".join(lines) + "\n")
