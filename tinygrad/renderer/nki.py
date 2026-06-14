@@ -39,6 +39,26 @@ def _affine(u:UOp) -> tuple[dict, int]:
 def _rsize(r:UOp) -> int: return int(r.src[0].arg)
 def _is_reduce(r:UOp) -> bool: return r.arg[1] is AxisType.REDUCE
 
+# ALU ops that can appear inside a data-dependent (gather) index expression
+ALU_SER = {Ops.ADD:"ADD", Ops.MUL:"MUL", Ops.SUB:"SUB", Ops.MAX:"MAX", Ops.CMPLT:"CMPLT",
+           Ops.CMPNE:"CMPNE", Ops.CMPEQ:"CMPEQ", Ops.AND:"AND", Ops.OR:"OR", Ops.XOR:"XOR",
+           Ops.FLOORDIV:"FLOORDIV", Ops.FLOORMOD:"FLOORMOD", Ops.CDIV:"CDIV", Ops.CMOD:"CMOD"}
+
+def _ser_index(u:UOp, canonical:list, npname) -> dict:
+  # serialize a (possibly data-dependent) index expression so the runtime can evaluate it over the
+  # iteration grid -> flat offsets -> gather. RANGE -> a grid coordinate; INDEX(param,...) -> a load.
+  if u.op is Ops.RANGE: return {"t":"rng", "ax":canonical.index(u)}
+  if u.op is Ops.CONST:
+    try: v = int(u.arg)
+    except (TypeError, ValueError): v = -1   # Invalid sentinel (OOB positions get clipped)
+    return {"t":"const", "v":v}
+  if u.op is Ops.CAST: return {"t":"cast", "s":[_ser_index(u.src[0], canonical, npname)]}
+  if u.op is Ops.WHERE: return {"t":"where", "s":[_ser_index(x, canonical, npname) for x in u.src]}
+  if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM:
+    return {"t":"load", "slot":u.src[0].arg.slot, "dtype":npname(u.src[0].dtype), "s":[_ser_index(u.src[1], canonical, npname)]}
+  if u.op in ALU_SER: return {"t":"alu", "op":ALU_SER[u.op], "s":[_ser_index(x, canonical, npname) for x in u.src]}
+  raise NotImplementedError(f"NKI gather index: unhandled {u.op}")
+
 class NKIRenderer(Renderer):
   suffix = "NKI"
   has_local = False
@@ -112,10 +132,13 @@ class NKIRenderer(Renderer):
     csize = [_rsize(r) for r in canonical]
     inputs_meta = []
     for u in in_index:
-      coeffs, offset = _affine(u.src[1])
-      if any(r not in canonical for r,c in coeffs.items() if c != 0): raise NotImplementedError("NKI: input axis not in iteration space")
-      inputs_meta.append({"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype),
-                          "strides":[coeffs.get(r, 0) for r in canonical], "offset":offset})
+      base = {"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype)}
+      try:                                   # affine index -> a strided view (fast path)
+        coeffs, offset = _affine(u.src[1])
+        if any(r not in canonical for r,c in coeffs.items() if c != 0): raise NotImplementedError("axis not in iteration space")
+        inputs_meta.append({**base, "kind":"strided", "strides":[coeffs.get(r, 0) for r in canonical], "offset":offset})
+      except NotImplementedError:            # data-dependent index (gather) -> serialize for runtime eval
+        inputs_meta.append({**base, "kind":"gather", "index":_ser_index(u.src[1], canonical, self._npname)})
 
     ref = "t0"
     lines = [f"    t{i} = nl.load(in{i})" for i in range(len(in_index))]
