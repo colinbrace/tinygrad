@@ -24,14 +24,23 @@ class TrainiumProgram:
     self.kernel = ns["kernel"]
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
-    dt = self.meta["np_dtypes"]
-    # bufs arrive in global/slot order; reshape each flat buffer to a (1, N) NKI tile
-    in_arrs = [np.frombuffer(bufs[s], dtype=np.dtype(dt[str(s)])).reshape(1, -1) for s in self.meta["in_slots"]]
-    if os.getenv("NKI_TRACE"): print(f"[trainium] running {self.name} via nki.simulate, in shapes={[a.shape for a in in_arrs]}")
+    m, dt = self.meta, self.meta["np_dtypes"]
+    npd = lambda s: np.dtype(dt[str(s)])
+    if m["kind"] == "elementwise":
+      # flat buffers -> (1, N) tiles
+      in_arrs = [np.frombuffer(bufs[s], dtype=npd(s)).reshape(1, -1) for s in m["in_slots"]]
+    else:  # reduce: arrange the input as (kept=partition, reduced=free) so nl.sum reduces axis 1
+      buf, shape = bufs[m["in_slot"]], m["in_shape"]
+      arr = np.frombuffer(buf, dtype=npd(m["in_slot"])).reshape(shape if shape else (1,))
+      perm = m["kept_pos"] + m["reduce_pos"]
+      arr = np.ascontiguousarray(np.transpose(arr, perm))
+      P = int(np.prod([shape[p] for p in m["kept_pos"]])) if m["kept_pos"] else 1
+      F = int(np.prod([shape[p] for p in m["reduce_pos"]]))
+      in_arrs = [arr.reshape(P, F)]
+    if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} ({m['kind']}) via nki.simulate, in={[a.shape for a in in_arrs]}")
     import nki
     out = np.asarray(nki.simulate(self.kernel)(*in_arrs))
-    os_slot = self.meta["out_slot"]
-    bufs[os_slot][:] = np.ascontiguousarray(out, dtype=np.dtype(dt[str(os_slot)])).tobytes()
+    bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=npd(m["out_slot"])).tobytes()
     return None
 
 class TrainiumDevice(Compiled):

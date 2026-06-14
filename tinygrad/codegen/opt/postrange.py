@@ -343,7 +343,7 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
     # beam search may open devices
     with Context(ALLOW_DEVICE_USAGE=1):
       k = beam_search(k, rawbufs, beam, bool(getenv("BEAM_ESTIMATE", 1)))
-  elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
+  elif not NOOPT and not getattr(ren, "disable_opts", False) and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
     if not any(u.op is Ops.STAGE for u in ast.backward_slice):

@@ -1,7 +1,7 @@
 from typing import cast
 from dataclasses import replace
 import itertools
-from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
+from tinygrad.helpers import getenv, DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
 from tinygrad.helpers import ALLOW_TF32, TracingKey, Context, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, Ops, UPat, track_rewrites, KernelInfo, ProgramInfo, GroupOp
 from tinygrad.uop.ops import ParamArg
@@ -83,6 +83,14 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # add locals
   sink = graph_rewrite(sink, pm_add_buffers_local+rangeify_codegen, ctx=itertools.count(0), name="add local buffers")
+
+  # high-level tile renderers (e.g. NKI) consume Ops.REDUCE / ALU / INDEX directly
+  # instead of the lowered scalar accumulator form -- stop before reduce removal.
+  if getattr(ren, "render_high_level", False):
+    if getenv("HL_DUMP"):
+      tl = list(sink.toposort()); idx = {u:i for i,u in enumerate(tl)}
+      for i,u in enumerate(tl): print(f"{i:3} {str(u.op):20} {str(u.dtype):14} src={[idx.get(s,'?') for s in u.src]} arg={u.arg!r}")
+    return sink
 
   # ** devectorizer (full_graph_rewrite) **
   # remove reduce
