@@ -56,7 +56,9 @@ class TrainiumProgram:
         d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
         return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
           flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
-      out = np.asarray(nki.simulate(self.kernel)(view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))))
+      args = [view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))]
+      args += [view(p, (m["M"], m["N"])) for p in m["post"]]   # post-ops (bias etc.) broadcast to (M,N)
+      out = np.asarray(nki.simulate(self.kernel)(*args))
       bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
       return None
     # Build each input INDEX as a strided view over the canonical iteration space: full size on
