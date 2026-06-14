@@ -22,10 +22,11 @@ def _eval_index(node, shape, bufs):
   if t == "where":
     c, a, b = (_eval_index(x, shape, bufs) for x in node["s"])
     return np.where(c, a, b)
-  if t == "load":
-    sub = _eval_index(node["s"][0], shape, bufs)
+  if t == "load":   # gated load: out-of-bounds (Invalid) index -> 0
+    sub = _eval_index(node["s"][0], shape, bufs).astype(np.int64)
     buf = np.frombuffer(bufs[node["slot"]], dtype=np.dtype(node["dtype"]))
-    return buf[np.clip(sub.astype(np.int64), 0, len(buf)-1)].astype(np.int64)
+    valid = (sub >= 0) & (sub < len(buf))
+    return np.where(valid, buf[np.clip(sub, 0, len(buf)-1)], 0).astype(np.int64)
   if t == "alu": return _ALU[node["op"]](*[_eval_index(x, shape, bufs) for x in node["s"]])
   raise NotImplementedError(f"NKI gather eval: {t}")
 
@@ -60,7 +61,8 @@ class TrainiumProgram:
       flat = np.frombuffer(bufs[inp["param_slot"]], dtype=d)
       if inp["kind"] == "gather":   # data-dependent index: eval offsets over the grid, then gather
         idx = _eval_index(inp["index"], cs, bufs)
-        view = flat[np.clip(idx, 0, len(flat)-1)]
+        valid = (idx >= 0) & (idx < len(flat))      # gated load: Invalid/OOB index -> 0 (e.g. cat/pad)
+        view = np.where(valid, flat[np.clip(idx, 0, len(flat)-1)], 0)
         shape = cs
       else:                         # affine: a strided view (full partition, natural free)
         st = inp["strides"]
