@@ -110,36 +110,38 @@ class NKIRenderer(Renderer):
 
   def _render_reduce(self, uops, params, store, out_slot, in_slots, dtmeta, reduces) -> str:
     if len(reduces) != 1: raise NotImplementedError("NKI: only single reduce supported")
-    if len(in_slots) != 1: raise NotImplementedError("NKI: reduce with !=1 input not supported")
-    red, in_slot = reduces[0], in_slots[0]
-    rop = red.arg[0]
-    if rop not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rop}")
-    # locate the input INDEX feeding the reduce, parse its affine index
-    def find_index(u):
-      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM: return u
-      for s in u.src:
-        if (r := find_index(s)) is not None: return r
-      return None
-    in_index = find_index(red.src[0])
-    in_axes = sorted(_affine(in_index.src[1]).items(), key=lambda kv: -kv[1])   # [(range, coeff)] outer->inner
-    in_shape = [_rsize(r) for r,_ in in_axes]
-    pos = {r:i for i,(r,_) in enumerate(in_axes)}
-    # kept axes in OUTPUT order (so partition rows line up with the output buffer)
-    out_axes = sorted(_affine(store.src[0].src[1]).items(), key=lambda kv: -kv[1])
-    kept_pos = [pos[r] for r,_ in out_axes if r in pos]
-    reduce_pos = [i for i,(r,_) in enumerate(in_axes) if _is_reduce(r)]
-    if len(reduce_pos) + len(kept_pos) != len(in_axes): raise NotImplementedError("NKI: reduce axis bookkeeping mismatch")
+    red = reduces[0]
+    if (rop := red.arg[0]) not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rop}")
+    # canonical iteration-space axes: kept (LOOP, in OUTPUT order) then the reduced axis.
+    # each input is broadcast to (kept..., reduce) so nl.sum/max reduces the trailing free dim.
+    reduce_range = red.src[1]
+    kept_ranges = [r for r,_ in sorted(_affine(store.src[0].src[1]).items(), key=lambda kv: -kv[1])]
+    canonical = kept_ranges + [reduce_range]
+    csize = [_rsize(r) for r in canonical]
+    # one INDEX per input param (accessed once); record its logical shape + canonical axis map
+    idx_of:dict = {}
+    for u in uops:
+      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and (s := u.src[0].arg.slot) in in_slots and s not in idx_of:
+        idx_of[s] = u
+    inputs_meta = []
+    for s in in_slots:
+      if s not in idx_of: raise NotImplementedError(f"NKI: input slot {s} not directly indexed")
+      axes = sorted(_affine(idx_of[s].src[1]).items(), key=lambda kv: -kv[1])
+      if any(r not in canonical for r,_ in axes): raise NotImplementedError("NKI: input axis not in iteration space")
+      inputs_meta.append({"slot":s, "logical_shape":[_rsize(r) for r,_ in axes],
+                          "canon_idx":[canonical.index(r) for r,_ in axes]})
 
-    lines = [f"    t{in_slot} = nl.load(in{in_slot})"]
+    ref = f"t{in_slots[0]}"
+    lines = [f"    t{s} = nl.load(in{s})" for s in in_slots]
     def leaf(u):
       if u is red: return "r"
       if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM: return f"t{u.src[0].arg.slot}"
       return None
-    reduced_expr = self._emit(red.src[0], leaf, f"t{in_slot}")
+    reduced_expr = self._emit(red.src[0], leaf, ref)
     lines.append(f"    r = {NL_REDUCE[rop]}({reduced_expr}, axis=[1], keepdims=True)")
     final = self._emit(store.src[1], leaf, "r")
-    lines += [f"    out{out_slot} = nl.ndarray((t{in_slot}.shape[0], 1), dtype=t{in_slot}.dtype, buffer=nl.shared_hbm)",
+    lines += [f"    out{out_slot} = nl.ndarray(({ref}.shape[0], 1), dtype={ref}.dtype, buffer=nl.shared_hbm)",
               f"    nl.store(out{out_slot}, value={final})", f"    return out{out_slot}"]
-    meta = {"kind":"reduce", "out_slot":out_slot, "in_slot":in_slot, "np_dtypes":dtmeta,
-            "in_shape":in_shape, "kept_pos":kept_pos, "reduce_pos":reduce_pos}
-    return self._source(f"in{in_slot}", lines, meta)
+    meta = {"kind":"reduce", "out_slot":out_slot, "np_dtypes":dtmeta,
+            "canonical_sizes":csize, "kept_count":len(kept_ranges), "inputs":inputs_meta}
+    return self._source(", ".join(f"in{s}" for s in in_slots), lines, meta)

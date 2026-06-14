@@ -29,17 +29,28 @@ class TrainiumProgram:
     if m["kind"] == "elementwise":
       # flat buffers -> (1, N) tiles
       in_arrs = [np.frombuffer(bufs[s], dtype=npd(s)).reshape(1, -1) for s in m["in_slots"]]
-    else:  # reduce: arrange the input as (kept=partition, reduced=free) so nl.sum reduces axis 1
-      buf, shape = bufs[m["in_slot"]], m["in_shape"]
-      arr = np.frombuffer(buf, dtype=npd(m["in_slot"])).reshape(shape if shape else (1,))
-      perm = m["kept_pos"] + m["reduce_pos"]
-      arr = np.ascontiguousarray(np.transpose(arr, perm))
-      P = int(np.prod([shape[p] for p in m["kept_pos"]])) if m["kept_pos"] else 1
-      F = int(np.prod([shape[p] for p in m["reduce_pos"]]))
-      in_arrs = [arr.reshape(P, F)]
+    else:  # reduce: broadcast each input to the iteration space (kept..., reduce), then (P=kept, F=reduce)
+      cs, kc, nd = m["canonical_sizes"], m["kept_count"], len(m["canonical_sizes"])
+      P = int(np.prod(cs[:kc])) if kc else 1
+      F = int(np.prod(cs[kc:])) if kc < nd else 1
+      in_arrs = []
+      for inp in m["inputs"]:
+        arr = np.frombuffer(bufs[inp["slot"]], dtype=npd(inp["slot"])).reshape(inp["logical_shape"] or (1,))
+        ci = inp["canon_idx"]
+        arr = np.transpose(arr, sorted(range(len(ci)), key=lambda i: ci[i]))   # logical axes -> canonical order
+        present = set(ci)
+        arr = arr.reshape([cs[c] if c in present else 1 for c in range(nd)])    # insert size-1 for missing axes
+        arr = np.ascontiguousarray(np.broadcast_to(arr, cs)).reshape(P, F)
+        in_arrs.append(arr)
     if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} ({m['kind']}) via nki.simulate, in={[a.shape for a in in_arrs]}")
     import nki
-    out = np.asarray(nki.simulate(self.kernel)(*in_arrs))
+    # NKI partition dim (axis 0) is capped at 128 -> tile the kernel call into <=128-row chunks
+    PMAX, rows = 128, in_arrs[0].shape[0]
+    if rows <= PMAX:
+      out = np.asarray(nki.simulate(self.kernel)(*in_arrs))
+    else:
+      out = np.concatenate([np.asarray(nki.simulate(self.kernel)(*[a[i:i+PMAX] for a in in_arrs]))
+                            for i in range(0, rows, PMAX)], axis=0)
     bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=npd(m["out_slot"])).tobytes()
     return None
 
