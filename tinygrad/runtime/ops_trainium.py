@@ -57,6 +57,12 @@ class TrainiumProgram:
     P = int(np.prod(cs[:split])) if split else 1
     in_arrs = []
     for inp in m["inputs"]:
+      if inp["kind"] == "iota":   # a RANGE used as a value -> coordinate of canonical axis over the grid
+        ax = inp["axis"]
+        sh = [1]*nd; sh[ax] = cs[ax]
+        coord = np.arange(cs[ax]).reshape(sh) + np.zeros(cs, dtype=np.int64)   # broadcast to full grid
+        in_arrs.append(coord.reshape(P, int(np.prod(cs[split:])) or 1).astype(np.float32))
+        continue
       d = np.dtype(inp["dtype"])
       flat = np.frombuffer(bufs[inp["param_slot"]], dtype=d)
       if inp["kind"] == "gather":   # data-dependent index: eval offsets over the grid, then gather

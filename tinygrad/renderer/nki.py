@@ -135,8 +135,7 @@ class NKIRenderer(Renderer):
     for u in uops:
       if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg.slot != out_slot and u is not out_index and u not in in_index:
         in_index.append(u)
-    if not in_index: raise NotImplementedError("NKI renderer: no input access")
-    tid = {u:i for i,u in enumerate(in_index)}
+    tid = {u:i for i,u in enumerate(in_index)}   # may be empty: a coord-only kernel (e.g. arange)
 
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
@@ -154,24 +153,38 @@ class NKIRenderer(Renderer):
       except NotImplementedError:            # data-dependent index (gather) -> serialize for runtime eval
         inputs_meta.append({**base, "kind":"gather", "index":_ser_index(u.src[1], canonical, self._npname)})
 
-    ref = "t0"
-    lines = [f"    t{i} = nl.load(in{i})" for i in range(len(in_index))]
+    ref = "t0" if in_index else "c0"   # coord-only kernels (arange) reference the first coord tile
     reduce_vars:dict = {}
+    coords:dict = {}            # RANGE used as a value -> coordinate tile var (arange / iota / triangular masks)
     def leaf(u):
       if u in reduce_vars: return reduce_vars[u]
       if u in tid: return f"t{tid[u]}"
+      if u.op is Ops.RANGE:
+        if u not in coords:
+          if u not in canonical: raise NotImplementedError("NKI: range-as-value not in iteration space")
+          coords[u] = f"c{len(coords)}"
+        return coords[u]
       return None
     # each reduce's inputs are (P, R_k) tiles (their index spans reduce range R_k); reduce the
     # trailing free axis -> (P,1). Independent reduces (e.g. attention numerator/denominator) are
     # separate statements; nested ones are emitted inner-first via the topological order above.
+    body = []
     for i, rd in enumerate(ordered):
-      lines.append(f"    r{i} = {NL_REDUCE[rd.arg[0]]}({self._emit(rd.src[0], leaf, ref)}, axis=[1], keepdims=True)")
+      body.append(f"    r{i} = {NL_REDUCE[rd.arg[0]]}({self._emit(rd.src[0], leaf, ref)}, axis=[1], keepdims=True)")
       reduce_vars[rd] = f"r{i}"
     out_free = 1 if ordered else (int(np.prod(csize[split:])) if split < len(csize) else 1)
     final = self._emit(store.src[1], leaf, ref)
+    # coordinate-as-value (arange etc.) is supported for elementwise kernels; coords interacting with
+    # a reduce need per-reduce placement (fused attention) -- not handled, so raise instead of silently wrong.
+    if coords and ordered: raise NotImplementedError("NKI: range-as-value combined with reduce not supported")
+    if not in_index and not coords: raise NotImplementedError("NKI renderer: no input access")
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
-    lines += [f"    out = nl.ndarray(({ref}.shape[0], {out_free}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
-              f"    nl.store(out, value=nl.broadcast_to({final}, out.shape))", "    return out"]
+    body += [f"    out = nl.ndarray(({ref}.shape[0], {out_free}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+             f"    nl.store(out, value=nl.broadcast_to({final}, out.shape))", "    return out"]
+    nin = len(in_index)
+    loads = [f"    t{i} = nl.load(in{i})" for i in range(nin)]
+    loads += [f"    {cv} = nl.load(in{nin+j})" for j,(r,cv) in enumerate(coords.items())]
+    inputs_meta += [{"kind":"iota", "axis":canonical.index(r)} for r in coords]
     meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "inputs":inputs_meta}
-    return self._source(", ".join(f"in{i}" for i in range(len(in_index))), lines, meta)
+    return self._source(", ".join(f"in{i}" for i in range(nin + len(coords))), loads + body, meta)
