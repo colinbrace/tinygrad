@@ -26,23 +26,22 @@ class TrainiumProgram:
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m, dt = self.meta, self.meta["np_dtypes"]
     npd = lambda s: np.dtype(dt[str(s)])
-    if m["kind"] == "elementwise":
-      # flat buffers -> (1, N) tiles
-      in_arrs = [np.frombuffer(bufs[s], dtype=npd(s)).reshape(1, -1) for s in m["in_slots"]]
-    else:  # reduce: broadcast each input to the iteration space (kept..., reduce), then (P=kept, F=reduce)
-      cs, kc, nd = m["canonical_sizes"], m["kept_count"], len(m["canonical_sizes"])
-      P = int(np.prod(cs[:kc])) if kc else 1
-      F = int(np.prod(cs[kc:])) if kc < nd else 1
-      in_arrs = []
-      for inp in m["inputs"]:
-        arr = np.frombuffer(bufs[inp["slot"]], dtype=npd(inp["slot"])).reshape(inp["logical_shape"] or (1,))
-        ci = inp["canon_idx"]
-        arr = np.transpose(arr, sorted(range(len(ci)), key=lambda i: ci[i]))   # logical axes -> canonical order
-        present = set(ci)
-        arr = arr.reshape([cs[c] if c in present else 1 for c in range(nd)])    # insert size-1 for missing axes
-        arr = np.ascontiguousarray(np.broadcast_to(arr, cs)).reshape(P, F)
-        in_arrs.append(arr)
-    if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} ({m['kind']}) via nki.simulate, in={[a.shape for a in in_arrs]}")
+    # broadcast each input over the PARTITION (kept) axes to a common P; leave FREE axes at the
+    # input's natural size (1 if absent) and let NKI's nl.* ops broadcast them. This lets a
+    # post-reduce operand (e.g. a bias spanning only kept axes) align (P,1) with the reduced (P,1).
+    cs, split, nd = m["canonical_sizes"], m["split"], len(m["canonical_sizes"])
+    P = int(np.prod(cs[:split])) if split else 1
+    in_arrs = []
+    for inp in m["inputs"]:
+      arr = np.frombuffer(bufs[inp["slot"]], dtype=npd(inp["slot"])).reshape(inp["logical_shape"] or (1,))
+      ci = inp["canon_idx"]
+      arr = np.transpose(arr, sorted(range(len(ci)), key=lambda i: ci[i]))   # logical axes -> canonical order
+      present = set(ci)
+      arr = arr.reshape([cs[c] if c in present else 1 for c in range(nd)])    # size-1 for missing axes
+      target = [cs[c] if (c < split or c in present) else 1 for c in range(nd)]  # full partition, natural free
+      arr = np.ascontiguousarray(np.broadcast_to(arr, target)).reshape(P, int(np.prod(target[split:])) or 1)
+      in_arrs.append(arr)
+    if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} via nki.simulate, in={[a.shape for a in in_arrs]}")
     import nki
     # NKI partition dim (axis 0) is capped at 128 -> tile the kernel call into <=128-row chunks
     PMAX, rows = 128, in_arrs[0].shape[0]

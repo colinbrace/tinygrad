@@ -87,38 +87,18 @@ class NKIRenderer(Renderer):
     if not in_slots: raise NotImplementedError("NKI renderer: no input params")
     dtmeta = {str(p.arg.slot): self._npname(p.dtype) for p in params}
     reduces = [u for u in uops if u.op is Ops.REDUCE]
-    if reduces: return self._render_reduce(uops, params, store, out_slot, in_slots, dtmeta, reduces)
-    return self._render_elementwise(store, out_slot, in_slots, dtmeta)
+    if len(reduces) > 1: raise NotImplementedError("NKI: only single reduce supported")
+    red = reduces[0] if reduces else None
+    if red is not None and red.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {red.arg[0]}")
 
-  def _render_elementwise(self, store, out_slot, in_slots, dtmeta) -> str:
-    ref = in_slots[0]
-    loaded:dict[int,str] = {ref: f"t{ref}"}
-    lines = [f"    t{ref} = nl.load(in{ref})"]
-    def leaf(u):
-      if u.op is Ops.INDEX:
-        if u.src[0].op is not Ops.PARAM: raise NotImplementedError(f"NKI: INDEX of {u.src[0].op}")
-        slot = u.src[0].arg.slot
-        if slot not in loaded:
-          loaded[slot] = f"t{slot}"; lines.append(f"    t{slot} = nl.load(in{slot})")
-        return loaded[slot]
-      return None
-    expr = self._emit(store.src[1], leaf, f"t{ref}")
-    lines += [f"    out{out_slot} = nl.ndarray(in{ref}.shape, dtype=in{ref}.dtype, buffer=nl.shared_hbm)",
-              f"    nl.store(out{out_slot}, value={expr})", f"    return out{out_slot}"]
-    meta = {"kind":"elementwise", "out_slot":out_slot, "in_slots":in_slots, "np_dtypes":dtmeta}
-    return self._source(", ".join(f"in{s}" for s in in_slots), lines, meta)
-
-  def _render_reduce(self, uops, params, store, out_slot, in_slots, dtmeta, reduces) -> str:
-    if len(reduces) != 1: raise NotImplementedError("NKI: only single reduce supported")
-    red = reduces[0]
-    if (rop := red.arg[0]) not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rop}")
-    # canonical iteration-space axes: kept (LOOP, in OUTPUT order) then the reduced axis.
-    # each input is broadcast to (kept..., reduce) so nl.sum/max reduces the trailing free dim.
-    reduce_range = red.src[1]
+    # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
+    # Each input is broadcast to this space; partition|free split at `split` (the runtime tiles
+    # partition <=128). Reduce -> nl.sum/max over the free (trailing) dim; elementwise -> keep it.
     kept_ranges = [r for r,_ in sorted(_affine(store.src[0].src[1]).items(), key=lambda kv: -kv[1])]
-    canonical = kept_ranges + [reduce_range]
+    canonical = kept_ranges + ([red.src[1]] if red is not None else [])
+    split = len(kept_ranges) if red is not None else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
-    # one INDEX per input param (accessed once); record its logical shape + canonical axis map
+    # one INDEX per input param; record its logical shape + map to canonical axes (for broadcasting)
     idx_of:dict = {}
     for u in uops:
       if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and (s := u.src[0].arg.slot) in in_slots and s not in idx_of:
@@ -137,11 +117,14 @@ class NKIRenderer(Renderer):
       if u is red: return "r"
       if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM: return f"t{u.src[0].arg.slot}"
       return None
-    reduced_expr = self._emit(red.src[0], leaf, ref)
-    lines.append(f"    r = {NL_REDUCE[rop]}({reduced_expr}, axis=[1], keepdims=True)")
-    final = self._emit(store.src[1], leaf, "r")
-    lines += [f"    out{out_slot} = nl.ndarray(({ref}.shape[0], 1), dtype={ref}.dtype, buffer=nl.shared_hbm)",
+    if red is not None:
+      lines.append(f"    r = {NL_REDUCE[red.arg[0]]}({self._emit(red.src[0], leaf, ref)}, axis=[1], keepdims=True)")
+      out_free = 1
+    else:
+      out_free = int(np.prod(csize[split:])) if split < len(csize) else 1
+    out_shape = f"({ref}.shape[0], {out_free})"
+    final = self._emit(store.src[1], leaf, ref)
+    lines += [f"    out{out_slot} = nl.ndarray({out_shape}, dtype={ref}.dtype, buffer=nl.shared_hbm)",
               f"    nl.store(out{out_slot}, value={final})", f"    return out{out_slot}"]
-    meta = {"kind":"reduce", "out_slot":out_slot, "np_dtypes":dtmeta,
-            "canonical_sizes":csize, "kept_count":len(kept_ranges), "inputs":inputs_meta}
+    meta = {"out_slot":out_slot, "np_dtypes":dtmeta, "canonical_sizes":csize, "split":split, "inputs":inputs_meta}
     return self._source(", ".join(f"in{s}" for s in in_slots), lines, meta)
