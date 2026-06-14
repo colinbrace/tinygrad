@@ -15,23 +15,25 @@ NL_BINOP = {Ops.ADD:"nl.add", Ops.MUL:"nl.multiply", Ops.SUB:"nl.subtract",
             Ops.CMPLT:"nl.less", Ops.CMPNE:"nl.not_equal", Ops.CMPEQ:"nl.equal"}
 NL_UNOP  = {Ops.NEG:"nl.negative", Ops.SQRT:"nl.sqrt", Ops.RECIPROCAL:"nl.reciprocal",
             Ops.SIN:"nl.sin"}
-NL_REDUCE = {Ops.ADD:"nl.sum", Ops.MAX:"nl.max"}
+NL_REDUCE = {Ops.ADD:"nl.sum", Ops.MAX:"nl.max", Ops.MUL:"nl.prod"}
 LN2 = 0.6931471805599453
 
-def _affine(u:UOp) -> dict:
-  # parse an integer index expression into {RANGE uop: coefficient}; CONST offsets dropped
-  if u.op is Ops.RANGE: return {u: 1}
-  if u.op is Ops.CONST: return {}
+def _affine(u:UOp) -> tuple[dict, int]:
+  # parse an integer index expr into ({RANGE uop: stride}, constant offset). strides index the FLAT
+  # buffer, so this captures contiguous / transpose / slice (offset) / broadcast (stride 0) uniformly.
+  if u.op is Ops.RANGE: return {u: 1}, 0
+  if u.op is Ops.CONST: return {}, int(u.arg)
   if u.op is Ops.ADD:
-    d:dict = {}
+    d:dict = {}; off = 0
     for s in u.src:
-      for k,v in _affine(s).items(): d[k] = d.get(k, 0) + v
-    return d
+      ds, o = _affine(s)
+      for k,v in ds.items(): d[k] = d.get(k, 0) + v
+      off += o
+    return d, off
   if u.op is Ops.MUL:
-    a, b = u.src
-    da, db = _affine(a), _affine(b)
-    if not da: return {k: v*int(a.arg) for k,v in db.items()}
-    if not db: return {k: v*int(b.arg) for k,v in da.items()}
+    (da, oa), (db, ob) = _affine(u.src[0]), _affine(u.src[1])
+    if not da: return {k: v*oa for k,v in db.items()}, oa*ob
+    if not db: return {k: v*ob for k,v in da.items()}, oa*ob
   raise NotImplementedError(f"NKI: non-affine index op {u.op}")
 
 def _rsize(r:UOp) -> int: return int(r.src[0].arg)
@@ -57,7 +59,9 @@ class NKIRenderer(Renderer):
       if dtypes.is_float(u.dtype): return repr(float(u.arg))
       if dtypes.is_int(u.dtype):   return repr(int(u.arg))
       return repr(bool(u.arg))
-    if u.op is Ops.CAST: return r(u.src[0])
+    if u.op is Ops.CAST:   # only a real dtype change needs an nl.copy; same-dtype CAST is a no-op
+      if u.dtype.scalar() != u.src[0].dtype.scalar(): return f"nl.copy({r(u.src[0])}, dtype=nl.{self._npname(u.dtype)})"
+      return r(u.src[0])
     if u.op is Ops.WHERE:
       tile = lambda s: f"nl.full({ref}.shape, {r(s)}, dtype={ref}.dtype)" if s.op is Ops.CONST else r(s)
       return f"nl.where({r(u.src[0])}, {tile(u.src[1])}, {tile(u.src[2])})"
@@ -82,49 +86,52 @@ class NKIRenderer(Renderer):
     stores = [u for u in uops if u.op is Ops.STORE]
     if len(stores) != 1: raise NotImplementedError(f"NKI renderer: expected 1 store, got {len(stores)}")
     store = stores[0]
-    out_slot = store.src[0].src[0].arg.slot
-    in_slots = [p.arg.slot for p in params if p.arg.slot != out_slot]
-    if not in_slots: raise NotImplementedError("NKI renderer: no input params")
-    dtmeta = {str(p.arg.slot): self._npname(p.dtype) for p in params}
+    out_index = store.src[0]
+    out_slot = out_index.src[0].arg.slot
+    out_dtype = self._npname(next(p for p in params if p.arg.slot == out_slot).dtype)
     reduces = [u for u in uops if u.op is Ops.REDUCE]
     if len(reduces) > 1: raise NotImplementedError("NKI: only single reduce supported")
     red = reduces[0] if reduces else None
     if red is not None and red.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {red.arg[0]}")
 
+    # Each distinct input INDEX node is its own tile -- so the same buffer read with two access
+    # patterns (e.g. a @ a.T) becomes two tiles. We pass a strided view per INDEX (the runtime
+    # as_strided reads contiguous / transpose / slice / broadcast uniformly).
+    in_index = []
+    for u in uops:
+      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg.slot != out_slot and u is not out_index and u not in in_index:
+        in_index.append(u)
+    if not in_index: raise NotImplementedError("NKI renderer: no input access")
+    tid = {u:i for i,u in enumerate(in_index)}
+
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
-    # Each input is broadcast to this space; partition|free split at `split` (the runtime tiles
-    # partition <=128). Reduce -> nl.sum/max over the free (trailing) dim; elementwise -> keep it.
-    kept_ranges = [r for r,_ in sorted(_affine(store.src[0].src[1]).items(), key=lambda kv: -kv[1])]
+    # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
+    kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
     canonical = kept_ranges + ([red.src[1]] if red is not None else [])
     split = len(kept_ranges) if red is not None else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
-    # one INDEX per input param; record its logical shape + map to canonical axes (for broadcasting)
-    idx_of:dict = {}
-    for u in uops:
-      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and (s := u.src[0].arg.slot) in in_slots and s not in idx_of:
-        idx_of[s] = u
     inputs_meta = []
-    for s in in_slots:
-      if s not in idx_of: raise NotImplementedError(f"NKI: input slot {s} not directly indexed")
-      axes = sorted(_affine(idx_of[s].src[1]).items(), key=lambda kv: -kv[1])
-      if any(r not in canonical for r,_ in axes): raise NotImplementedError("NKI: input axis not in iteration space")
-      inputs_meta.append({"slot":s, "logical_shape":[_rsize(r) for r,_ in axes],
-                          "canon_idx":[canonical.index(r) for r,_ in axes]})
+    for u in in_index:
+      coeffs, offset = _affine(u.src[1])
+      if any(r not in canonical for r,c in coeffs.items() if c != 0): raise NotImplementedError("NKI: input axis not in iteration space")
+      inputs_meta.append({"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype),
+                          "strides":[coeffs.get(r, 0) for r in canonical], "offset":offset})
 
-    ref = f"t{in_slots[0]}"
-    lines = [f"    t{s} = nl.load(in{s})" for s in in_slots]
+    ref = "t0"
+    lines = [f"    t{i} = nl.load(in{i})" for i in range(len(in_index))]
     def leaf(u):
       if u is red: return "r"
-      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM: return f"t{u.src[0].arg.slot}"
+      if u in tid: return f"t{tid[u]}"
       return None
     if red is not None:
       lines.append(f"    r = {NL_REDUCE[red.arg[0]]}({self._emit(red.src[0], leaf, ref)}, axis=[1], keepdims=True)")
       out_free = 1
     else:
       out_free = int(np.prod(csize[split:])) if split < len(csize) else 1
-    out_shape = f"({ref}.shape[0], {out_free})"
     final = self._emit(store.src[1], leaf, ref)
-    lines += [f"    out{out_slot} = nl.ndarray({out_shape}, dtype={ref}.dtype, buffer=nl.shared_hbm)",
-              f"    nl.store(out{out_slot}, value={final})", f"    return out{out_slot}"]
-    meta = {"out_slot":out_slot, "np_dtypes":dtmeta, "canonical_sizes":csize, "split":split, "inputs":inputs_meta}
-    return self._source(", ".join(f"in{s}" for s in in_slots), lines, meta)
+    # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
+    # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
+    lines += [f"    out = nl.ndarray(({ref}.shape[0], {out_free}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+              f"    nl.store(out, value=nl.broadcast_to({final}, out.shape))", "    return out"]
+    meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "inputs":inputs_meta}
+    return self._source(", ".join(f"in{i}" for i in range(len(in_index))), lines, meta)
