@@ -19,6 +19,8 @@ _KERNEL_CACHE:dict = {}
 _COMPILED_CACHE:dict = {}
 # cross-process on-disk NEFF cache root: a fresh process reuses an existing kernel.neff (skips neuron-cc)
 _NEFF_CACHE_DIR = os.getenv("TRAINIUM_NEFF_CACHE", os.path.join(tempfile.gettempdir(), "tinygrad_nki_neff"))
+# loaded SpikeModel per (src_hash, arg sig, core_id) for multi-core (per-NeuronCore) execution
+_MODEL_CACHE:dict = {}
 
 _ALU = {"ADD":lambda a,b:a+b, "MUL":lambda a,b:a*b, "SUB":lambda a,b:a-b, "MAX":np.maximum,
         "FLOORDIV":lambda a,b:a//b, "FLOORMOD":lambda a,b:a%b,
@@ -133,8 +135,25 @@ class TrainiumProgram:
       return np.asarray(nki.simulate(self.kernel)(*np_args))
     if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
     compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
+    if self.core_id != 0: return self._run_on_core(compiled, names, np_args)   # multi-core: target this core
     res = compiled.run(**dict(zip(names, np_args)))                # core 0: the well-tested high-level run
     return np.asarray(next(iter(res.outputs.values())))
+
+  def _run_on_core(self, compiled, names, np_args):
+    # Run a cached NEFF on a SPECIFIC NeuronCore. The high-level CompiledKernel.run() / _ensure_loaded()
+    # hardcode core 0 (SpikeModel.load_from_neff(neff_path) with the default core_id=0), so for core N we
+    # load our own SpikeModel with core_id=N and place every I/O SpikeTensor on core N. The loaded model
+    # is cached per (kernel, signature, core) and reused, so repeat launches are just DMA + execute.
+    # This mirrors CompiledKernel.run() exactly (from_numpy inputs, prepare_outputs, model(in, outputs=)),
+    # only threading core_id throughout.
+    from nki.runtime import SpikeModel, SpikeTensor
+    key = (self._srchash, tuple((tuple(a.shape), a.dtype.str) for a in np_args), self.core_id)
+    if (model := _MODEL_CACHE.get(key)) is None:
+      model = _MODEL_CACHE[key] = SpikeModel.load_from_neff(compiled.neff_path, core_id=self.core_id)
+    si = {n: SpikeTensor.from_numpy(np.ascontiguousarray(a), n, core_id=self.core_id) for n, a in zip(names, np_args)}
+    so = {n: SpikeTensor.from_numpy(v, n, core_id=self.core_id) for n, v in compiled.prepare_outputs().items()}
+    model(si, outputs=so)
+    return np.asarray(next(iter(so.values())).numpy())
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
