@@ -11,6 +11,9 @@ from tinygrad.renderer.nki import NKIRenderer
 # callable compiles to a NEFF and executes on /dev/neuron* when called directly with numpy arrays.
 _HW = os.getenv("TRAINIUM_HW") == "1"
 
+# built kernel callables keyed by source hash; see TrainiumProgram._build_kernel for why this matters
+_KERNEL_CACHE:dict = {}
+
 _ALU = {"ADD":lambda a,b:a+b, "MUL":lambda a,b:a*b, "SUB":lambda a,b:a-b, "MAX":np.maximum,
         "FLOORDIV":lambda a,b:a//b, "FLOORMOD":lambda a,b:a%b,
         "CDIV":lambda a,b:(np.abs(a)//np.abs(b))*np.sign(a)*np.sign(b), "CMOD":lambda a,b:a-(_ALU["CDIV"](a,b))*b,
@@ -54,22 +57,32 @@ class TrainiumProgram:
 
   @staticmethod
   def _build_kernel(name:str, src:str):
+    import hashlib
+    h = hashlib.sha256(src.encode()).hexdigest()[:16]
+    # Cache the kernel CALLABLE by source hash. nki.jit's NEFF compile-cache lives ON the function
+    # object (func._nki_compile_cache), so a stable func per unique source lets every realization
+    # of an identical kernel -- across Program rebuilds and the >128-row tiling loop -- reuse the
+    # same compiled NEFF instead of re-running neuron-cc (~11s each). Keyed by source, not (name,
+    # shapes): the source already encodes the kernel, and nki keys its own cache by arg shapes.
+    if (cached := _KERNEL_CACHE.get(h)) is not None: return cached
     # The sim just needs the callable, so exec'ing the source is enough. The HW compiler frontend,
     # however, looks the entry function up by source location (AST/linecache), so an exec'd kernel
     # fails with "entry function not found" -- it must live in a real importable .py file.
     if not _HW:
       ns:dict = {}
       exec(compile(src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
-      return ns["kernel"]
-    import importlib.util, hashlib, tempfile
-    h = hashlib.sha256(src.encode()).hexdigest()[:16]
-    d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"k_{h}.py")
-    if not os.path.exists(path):
-      with open(path, "w") as f: f.write(src)
-    spec = importlib.util.spec_from_file_location(f"tinygrad_nki_k_{h}", path)
-    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    return mod.kernel
+      kernel = ns["kernel"]
+    else:
+      import importlib.util, tempfile
+      d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
+      path = os.path.join(d, f"k_{h}.py")
+      if not os.path.exists(path):
+        with open(path, "w") as f: f.write(src)
+      spec = importlib.util.spec_from_file_location(f"tinygrad_nki_k_{h}", path)
+      mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+      kernel = mod.kernel
+    _KERNEL_CACHE[h] = kernel
+    return kernel
 
   def _run(self, *np_args):
     # one place the two paths diverge: real device vs CPU simulator. numpy in -> numpy out either way.
@@ -115,12 +128,33 @@ class TrainiumProgram:
         view = np.lib.stride_tricks.as_strided(flat[inp["offset"]:], shape=shape, strides=[st[c]*d.itemsize for c in range(nd)])
       in_arrs.append(np.ascontiguousarray(view).reshape(P, int(np.prod(shape[split:])) or 1))
     if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} {'on HW' if _HW else 'via nki.simulate'}, in={[a.shape for a in in_arrs]}")
-    # NKI partition dim (axis 0) is capped at 128 -> tile the kernel call into <=128-row chunks
-    PMAX, rows = 128, in_arrs[0].shape[0]
-    if rows <= PMAX:
-      out = self._run(*in_arrs)
+    PMAX, FMAX, FFLAT = 128, 4096, 8192   # partition cap 128; free chunk for SBUF; (1,N) is safe up to FFLAT
+    if m.get("flat"):        # split==0 AND no reduce (a full reduce is also split==0 but outputs (P,1))
+      # pure flat elementwise. A single (1,N) tile is fine (and matches the proven small-tensor path) until
+      # N is large enough to overflow the 192KB/partition SBUF; only then spread N across <=128 partitions
+      # (and free-chunk if still wide). Elementwise is position-preserving, so any reshape covering N works
+      # as long as we flatten the result back. (Spreading only when N>FFLAT also avoids F==1 tiles, which
+      # fail MLIR verification for fp16.)
+      N = max(a.shape[1] for a in in_arrs)
+      if N <= FFLAT:
+        out = self._run(*in_arrs)
+      else:
+        Pn = min(PMAX, N); F = -(-N // Pn); pad = Pn*F - N
+        def spread(a):
+          if a.shape[1] == 1: return np.broadcast_to(a, (Pn, F)).copy()    # scalar/broadcast operand
+          flat = a.reshape(-1)
+          if pad: flat = np.concatenate([flat, np.zeros(pad, flat.dtype)])
+          return flat.reshape(Pn, F)
+        sa = [spread(a) for a in in_arrs]
+        if F <= FMAX: out = self._run(*sa)
+        else: out = np.concatenate([self._run(*[c[:, j:j+FMAX] for c in sa]) for j in range(0, F, FMAX)], axis=1)
+      out = np.asarray(out).reshape(-1)[:N]
     else:
-      out = np.concatenate([self._run(*[a[i:i+PMAX] for a in in_arrs]) for i in range(0, rows, PMAX)], axis=0)
+      rows = in_arrs[0].shape[0]
+      if rows <= PMAX:
+        out = self._run(*in_arrs)
+      else:
+        out = np.concatenate([self._run(*[a[i:i+PMAX] for a in in_arrs]) for i in range(0, rows, PMAX)], axis=0)
     bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
     return None
 

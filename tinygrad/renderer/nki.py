@@ -250,11 +250,18 @@ class NKIRenderer(Renderer):
     if not in_index and not coords: raise NotImplementedError("NKI renderer: no input access")
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
-    body += [f"    out = nl.ndarray(({ref}.shape[0], {out_free}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+    # A pure flat elementwise (split==0, no reduce) puts everything in the free dim. Hardcoding out_free
+    # there forces a single (1,N) tile that overflows the 192KB/partition SBUF for large N (the sim
+    # doesn't model capacity, so it only fails on real HW). Emit a DYNAMIC free size so the runtime can
+    # reshape the flat data into (P<=128, F) -- spreading it across partitions -- and free-chunk if wide.
+    # (A full reduce is also split==0 but its out is (P,1), so it must keep the hardcoded out_free.)
+    flat = split == 0 and not ordered
+    of = f"{ref}.shape[1]" if flat else str(out_free)
+    body += [f"    out = nl.ndarray(({ref}.shape[0], {of}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
              f"    nl.store(out, value=nl.broadcast_to({final}, out.shape))", "    return out"]
     nin = len(in_index)
     loads = [f"    t{i} = nl.load(in{i})" for i in range(nin)]
     loads += [f"    {cv} = nl.load(in{nin+j})" for j,(r,cv) in enumerate(coords.items())]
     inputs_meta += [{"kind":"iota", "axis":canonical.index(r)} for r in coords]
-    meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "inputs":inputs_meta}
+    meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "flat":flat, "inputs":inputs_meta}
     return self._source(", ".join(f"in{i}" for i in range(nin + len(coords))), loads + body, meta)
