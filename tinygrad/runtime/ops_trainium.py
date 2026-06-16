@@ -137,14 +137,17 @@ class TrainiumProgram:
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
-    if m.get("kind") == "matmul":   # nl.matmul fast path: build A as (K,M), B as (K,N) strided views
-      def view(spec, shape):
+    if m.get("kind") == "matmul":   # nc_matmul fast path: build A as (Bp,K,M), B as (Bp,K,N) strided views
+      batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1
+      def view(spec, tail):
+        # shape (*batch, *tail); strides come from the renderer (0 on a batch axis = broadcast that operand).
         d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
-        return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
-          flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
+        arr = np.lib.stride_tricks.as_strided(flat[spec["offset"]:], shape=(*batch, *tail),
+                                              strides=[s*d.itemsize for s in spec["strides"]])
+        return np.ascontiguousarray(arr).reshape(Bp, *tail)
       args = [view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))]
-      args += [view(p, (m["M"], m["N"])) for p in m["post"]]   # post-ops (bias etc.) broadcast to (M,N)
-      out = self._run(*args)
+      args += [view(p, (m["M"], m["N"])) for p in m["post"]]   # post-ops (bias etc.) broadcast to (Bp,M,N)
+      out = self._run(*args)                                    # kernel returns (Bp, M, N)
       bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
       return None
     # Build each input INDEX as a strided view over the canonical iteration space: full size on

@@ -103,9 +103,11 @@ class NKIRenderer(Renderer):
             f"@nki.jit\ndef kernel({sig}):\n" + "\n".join(lines) + "\n")
 
   def _match_matmul(self, store, ordered, kept_ranges, out_slot, out_dtype, in_index):
-    # detect out[m,n] = f(sum_k a[m,k]*b[k,n], <elementwise post-ops>): a 2D sum-reduce of a product of
-    # two indexed inputs, optionally fused with elementwise post-ops (bias/scale/activation) on (M,N).
-    if len(ordered) != 1 or len(kept_ranges) != 2: return None
+    # detect out[*b,m,n] = f(sum_k a[*b,m,k]*b[*b,k,n], <post-ops>): a sum-reduce of a product of two
+    # indexed inputs over the trailing two kept axes (M,N), with any number of leading BATCH axes,
+    # optionally fused with elementwise post-ops on (*b,M,N). Routes to a tiled nc_matmul, avoiding the
+    # generic path's O(B*M*N*K) broadcast-materialize. (2D matmul is the batch==[] special case, Bp=1.)
+    if len(ordered) != 1 or len(kept_ranges) < 2: return None
     rd = ordered[0]
     if rd.arg[0] is not Ops.ADD: return None
     strip = lambda u: strip(u.src[0]) if u.op is Ops.CAST else u
@@ -113,13 +115,15 @@ class NKIRenderer(Renderer):
     if body.op is not Ops.MUL: return None
     xa, xb = strip(body.src[0]), strip(body.src[1])
     if not all(x.op is Ops.INDEX and x.src[0].op is Ops.PARAM for x in (xa, xb)): return None
-    K, (Mr, Nr) = rd.src[1], kept_ranges
+    K = rd.src[1]; *batch_rs, Mr, Nr = kept_ranges          # trailing two kept axes are M,N; rest are batch
     (ca, oa), (cb, ob) = _affine(xa.src[1]), _affine(xb.src[1])
     # orient so A spans (rows Mr, K) and B spans (K, cols Nr); swap operands if needed
     if Mr in cb and Nr in ca: (xa, ca, oa), (xb, cb, ob) = (xb, cb, ob), (xa, ca, oa)
     if not (Mr in ca and K in ca and Nr in cb and K in cb): return None
     Msz, Nsz, Ksz = _rsize(Mr), _rsize(Nr), _rsize(K)
-    # post-reduce operands (bias etc.): every other indexed input, affine over the kept axes only, as (M,N)
+    batch = [_rsize(r) for r in batch_rs]
+    bs = lambda c: [c.get(r, 0) for r in batch_rs]           # per-batch-axis stride (0 = broadcast that operand)
+    # post-reduce operands (bias etc.): every other indexed input, affine over the kept axes only, as (*b,M,N)
     post = [u for u in in_index if u is not xa and u is not xb]
     post_meta = []
     for u in post:
@@ -127,37 +131,40 @@ class NKIRenderer(Renderer):
       except NotImplementedError: return None                # data-dependent post-op -> generic path
       if K in c: return None                                 # a post-op may not span the contraction
       post_meta.append({"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype),
-                        "strides":[c.get(Mr, 0), c.get(Nr, 0)], "offset":o})
+                        "strides":bs(c)+[c.get(Mr, 0), c.get(Nr, 0)], "offset":o})
     tpost = {u:i for i,u in enumerate(post)}
     def leaf(u):
       if u is rd: return "res_s"                             # the (tile of the) matmul result
       if u in tpost: return f"t{tpost[u]}"
       return None
     final = self._emit(store.src[1], leaf, "res_s")
-    # A is passed transposed as (K, M), B as (K, N). nc_matmul(res, A_kt, B_k) computes A_kt.T @ B_k.
-    meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "M":Msz, "N":Nsz, "K":Ksz,
-            "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":[ca[K], ca[Mr]], "offset":oa},
-            "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":[cb[K], cb[Nr]], "offset":ob},
+    # A is passed as (Bp, K, M), B as (Bp, K, N). nc_matmul(res, A_kt, B_k) computes A_kt.T @ B_k per batch.
+    meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "batch":batch, "M":Msz, "N":Nsz, "K":Ksz,
+            "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":bs(ca)+[ca[K], ca[Mr]], "offset":oa},
+            "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":bs(cb)+[cb[K], cb[Nr]], "offset":ob},
             "post":post_meta}
-    # Tiled Tensor-Engine matmul: tile the output into <=128 (M) x <=512 (N) blocks; for each, accumulate
-    # the contraction over <=128-wide K-blocks into one PSUM tile (successive nc_matmul accumulate), copy
-    # to SBUF, apply elementwise post-ops, store. min(...) handles ragged (non-multiple) tail tiles.
-    i4, i8, i12, i16 = "    ", "        ", "            ", "                "
-    lines = [f"{i4}out = nl.ndarray(({Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
-             f"{i4}for mi in range(0, {Msz}, 128):",
-             f"{i8}m1 = min(mi + 128, {Msz})",
-             f"{i8}for ni in range(0, {Nsz}, 512):",
-             f"{i12}n1 = min(ni + 512, {Nsz})",
-             f"{i12}res = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.float32, buffer=nl.psum)",
-             f"{i12}for ki in range(0, {Ksz}, 128):",
-             f"{i16}k1 = min(ki + 128, {Ksz})",
-             f"{i16}a_t = nl.load(in0[ki:k1, mi:m1])",
-             f"{i16}b_t = nl.load(in1[ki:k1, ni:n1])",
-             f"{i16}nisa.nc_matmul(res, a_t, b_t)",
-             f"{i12}res_s = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.{out_dtype}, buffer=nl.sbuf)",
-             f"{i12}nisa.tensor_copy(res_s, res)"]
-    lines += [f"{i12}t{i} = nl.load(in{i+2}[mi:m1, ni:n1])" for i in range(len(post))]
-    lines += [f"{i12}nl.store(out[mi:m1, ni:n1], value=nl.broadcast_to({final}, res_s.shape))",
+    # Tiled Tensor-Engine matmul: loop leading batch (Bp=prod(batch), 1 if 2D); per batch, tile the output
+    # into <=128 (M) x <=512 (N) blocks; for each, accumulate the contraction over <=128-wide K-blocks into
+    # one PSUM tile (successive nc_matmul accumulate), copy to SBUF, apply post-ops, store. min(...) handles
+    # ragged tails. Inputs are 3D (Bp,K,*) and output 3D (Bp,M,N); for 2D the Bp=1 axis flattens away.
+    Bp = int(np.prod(batch)) if batch else 1
+    i4, i8, i12, i16, i20 = "    ", "        ", "            ", "                ", "                    "
+    lines = [f"{i4}out = nl.ndarray(({Bp}, {Msz}, {Nsz}), dtype=nl.{out_dtype}, buffer=nl.shared_hbm)",
+             f"{i4}for bb in range({Bp}):",
+             f"{i8}for mi in range(0, {Msz}, 128):",
+             f"{i12}m1 = min(mi + 128, {Msz})",
+             f"{i12}for ni in range(0, {Nsz}, 512):",
+             f"{i16}n1 = min(ni + 512, {Nsz})",
+             f"{i16}res = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.float32, buffer=nl.psum)",
+             f"{i16}for ki in range(0, {Ksz}, 128):",
+             f"{i20}k1 = min(ki + 128, {Ksz})",
+             f"{i20}a_t = nl.load(in0[bb, ki:k1, mi:m1])",
+             f"{i20}b_t = nl.load(in1[bb, ki:k1, ni:n1])",
+             f"{i20}nisa.nc_matmul(res, a_t, b_t)",
+             f"{i16}res_s = nl.ndarray((m1 - mi, n1 - ni), dtype=nl.{out_dtype}, buffer=nl.sbuf)",
+             f"{i16}nisa.tensor_copy(res_s, res)"]
+    lines += [f"{i16}t{i} = nl.load(in{i+2}[bb, mi:m1, ni:n1])" for i in range(len(post))]
+    lines += [f"{i16}nl.store(out[bb, mi:m1, ni:n1], value=nl.broadcast_to({final}, res_s.shape))",
               f"{i4}return out"]
     sig = ", ".join(["in0", "in1"] + [f"in{i+2}" for i in range(len(post))])
     return (f"# TRAINIUM_META {json.dumps(meta)}\nimport nki\nimport nki.language as nl\nimport nki.isa as nisa\n\n"
