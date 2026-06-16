@@ -60,7 +60,8 @@ class TrainiumProgram:
     self.meta = json.loads(self.src.splitlines()[0].split("TRAINIUM_META", 1)[1])
     self._srchash = hashlib.sha256(self.src.encode()).hexdigest()[:16]
     if os.getenv("NKI_SRC"): print(self.src)
-    self.kernel = self._build_kernel(name, self.src)
+    # a constfill is folded in the runtime (no device kernel), so don't build one
+    self.kernel = None if self.meta.get("kind") == "constfill" else self._build_kernel(name, self.src)
 
   @staticmethod
   def _build_kernel(name:str, src:str):
@@ -137,16 +138,21 @@ class TrainiumProgram:
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
+    if m.get("kind") == "constfill":   # pure-constant tensor (Tensor.full/zeros/ones): fill in numpy, no device
+      d = np.dtype(m["out_dtype"]); n = len(bufs[m["out_slot"]]) // d.itemsize
+      bufs[m["out_slot"]][:] = np.full(n, m["value"], dtype=d).tobytes()
+      return None
     if m.get("kind") == "matmul":   # nc_matmul fast path: build A as (Bp,K,M), B as (Bp,K,N) strided views
-      batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1
-      def view(spec, tail):
-        # shape (*batch, *tail); strides come from the renderer (0 on a batch axis = broadcast that operand).
+      batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1; Ksizes = m["Ksizes"]
+      def view(spec, shape):
+        # strides come from the renderer (0 on a batch axis = broadcast that operand). The contraction may
+        # span >1 axis (Ksizes), e.g. a reshape merging heads*head_dim -- materialize then flatten below.
         d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
-        arr = np.lib.stride_tricks.as_strided(flat[spec["offset"]:], shape=(*batch, *tail),
-                                              strides=[s*d.itemsize for s in spec["strides"]])
-        return np.ascontiguousarray(arr).reshape(Bp, *tail)
-      args = [view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))]
-      args += [view(p, (m["M"], m["N"])) for p in m["post"]]   # post-ops (bias etc.) broadcast to (Bp,M,N)
+        return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
+          flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
+      args = [view(m["A"], (*batch, *Ksizes, m["M"])).reshape(Bp, m["K"], m["M"]),
+              view(m["B"], (*batch, *Ksizes, m["N"])).reshape(Bp, m["K"], m["N"])]
+      args += [view(p, (*batch, m["M"], m["N"])).reshape(Bp, m["M"], m["N"]) for p in m["post"]]  # -> (Bp,M,N)
       out = self._run(*args)                                    # kernel returns (Bp, M, N)
       bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
       return None
@@ -203,8 +209,23 @@ class TrainiumProgram:
         out = self._run(*in_arrs)
       else:
         out = np.concatenate([self._run(*[a[i:i+PMAX] for a in in_arrs]) for i in range(0, rows, PMAX)], axis=0)
-    bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
+    self._writeback(bufs, m, out)
     return None
+
+  @staticmethod
+  def _writeback(bufs, m, out):
+    # place the (kept-axis) result into the output buffer. Fast path: a normal full contiguous output is
+    # written densely. Otherwise (assign-into-a-slice, e.g. the KV cache) scatter via the out strides/
+    # offset and keep the rest of the buffer intact.
+    d = np.dtype(m["out_dtype"]); slot = m["out_slot"]; nbuf = len(bufs[slot]) // d.itemsize
+    val = np.ascontiguousarray(out, dtype=d)
+    kept, off, ostr = m["out_kept"], m["out_off"], m["out_strides"]
+    contig = ostr == [int(np.prod(kept[i+1:])) for i in range(len(kept))]
+    if off == 0 and val.size == nbuf and contig:
+      bufs[slot][:] = val.tobytes(); return
+    full = np.frombuffer(bufs[slot], dtype=d).copy()
+    np.lib.stride_tricks.as_strided(full[off:], shape=kept, strides=[s*d.itemsize for s in ostr])[...] = val.reshape(kept)
+    bufs[slot][:] = full.tobytes()
 
 class TrainiumDevice(Compiled):
   def __init__(self, device:str):

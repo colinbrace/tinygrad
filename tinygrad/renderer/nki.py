@@ -4,7 +4,7 @@
 # render_high_level hook in codegen/__init__.py). NKI is a tile-op machine, so we
 # map high-level ops directly: ALU -> nl.*, Ops.REDUCE -> nl.sum/nl.max.
 # See scratch/ml/theory/tinygrad-notes/backend_design.md.
-import os, json
+import os, json, math
 import numpy as np
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp, AxisType
@@ -76,7 +76,9 @@ class NKIRenderer(Renderer):
     lf = leaf(u)
     if lf is not None: return lf
     if u.op is Ops.CONST:
-      if dtypes.is_float(u.dtype): return repr(float(u.arg))
+      if dtypes.is_float(u.dtype):
+        v = float(u.arg)
+        return repr(v) if math.isfinite(v) else f"float('{v}')"   # inf/-inf/nan aren't valid bare literals
       if dtypes.is_int(u.dtype):   return repr(int(u.arg))
       return repr(bool(u.arg))
     if u.op is Ops.CAST:   # only a real dtype change needs an nl.copy; same-dtype CAST is a no-op
@@ -115,21 +117,23 @@ class NKIRenderer(Renderer):
     if body.op is not Ops.MUL: return None
     xa, xb = strip(body.src[0]), strip(body.src[1])
     if not all(x.op is Ops.INDEX and x.src[0].op is Ops.PARAM for x in (xa, xb)): return None
-    K = rd.src[1]; *batch_rs, Mr, Nr = kept_ranges          # trailing two kept axes are M,N; rest are batch
-    (ca, oa), (cb, ob) = _affine(xa.src[1]), _affine(xb.src[1])
-    # orient so A spans (rows Mr, K) and B spans (K, cols Nr); swap operands if needed
-    if Mr in cb and Nr in ca: (xa, ca, oa), (xb, cb, ob) = (xb, cb, ob), (xa, ca, oa)
-    if not (Mr in ca and K in ca and Nr in cb and K in cb): return None
-    Msz, Nsz, Ksz = _rsize(Mr), _rsize(Nr), _rsize(K)
+    Kr = list(rd.src[1:]); *batch_rs, Mr, Nr = kept_ranges  # contraction = ALL reduce ranges (may be >1,
+    (ca, oa), (cb, ob) = _affine(xa.src[1]), _affine(xb.src[1])   # e.g. a reshape merges (heads, head_dim));
+    # orient so A spans (rows Mr, K...) and B spans (K..., cols Nr); swap operands if needed   # trailing
+    if Mr in cb and Nr in ca: (xa, ca, oa), (xb, cb, ob) = (xb, cb, ob), (xa, ca, oa)          # two kept = M,N
+    if not (Mr in ca and Nr in cb and all(k in ca and k in cb for k in Kr)): return None
+    Msz, Nsz = _rsize(Mr), _rsize(Nr)
+    Ksizes = [_rsize(k) for k in Kr]; Ksz = int(np.prod(Ksizes))   # flattened contraction width
     batch = [_rsize(r) for r in batch_rs]
     bs = lambda c: [c.get(r, 0) for r in batch_rs]           # per-batch-axis stride (0 = broadcast that operand)
+    ks = lambda c: [c[k] for k in Kr]                        # per-contraction-axis stride
     # post-reduce operands (bias etc.): every other indexed input, affine over the kept axes only, as (*b,M,N)
     post = [u for u in in_index if u is not xa and u is not xb]
     post_meta = []
     for u in post:
       try: c, o = _affine(u.src[1])
       except NotImplementedError: return None                # data-dependent post-op -> generic path
-      if K in c: return None                                 # a post-op may not span the contraction
+      if any(k in c for k in Kr): return None                # a post-op may not span the contraction
       post_meta.append({"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype),
                         "strides":bs(c)+[c.get(Mr, 0), c.get(Nr, 0)], "offset":o})
     tpost = {u:i for i,u in enumerate(post)}
@@ -138,10 +142,10 @@ class NKIRenderer(Renderer):
       if u in tpost: return f"t{tpost[u]}"
       return None
     final = self._emit(store.src[1], leaf, "res_s")
-    # A is passed as (Bp, K, M), B as (Bp, K, N). nc_matmul(res, A_kt, B_k) computes A_kt.T @ B_k per batch.
-    meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "batch":batch, "M":Msz, "N":Nsz, "K":Ksz,
-            "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":bs(ca)+[ca[K], ca[Mr]], "offset":oa},
-            "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":bs(cb)+[cb[K], cb[Nr]], "offset":ob},
+    # A is passed as (Bp, K, M), B as (Bp, K, N) (K = flattened Ksizes). nc_matmul(res,A_kt,B_k)=A_kt.T@B_k.
+    meta = {"kind":"matmul", "out_slot":out_slot, "out_dtype":out_dtype, "batch":batch, "M":Msz, "N":Nsz, "K":Ksz, "Ksizes":Ksizes,
+            "A":{"param_slot":xa.src[0].arg.slot, "dtype":self._npname(xa.src[0].dtype), "strides":bs(ca)+ks(ca)+[ca[Mr]], "offset":oa},
+            "B":{"param_slot":xb.src[0].arg.slot, "dtype":self._npname(xb.src[0].dtype), "strides":bs(cb)+ks(cb)+[cb[Nr]], "offset":ob},
             "post":post_meta}
     # Tiled Tensor-Engine matmul: loop leading batch (Bp=prod(batch), 1 if 2D); per batch, tile the output
     # into <=128 (M) x <=512 (N) blocks; for each, accumulate the contraction over <=128-wide K-blocks into
@@ -210,6 +214,20 @@ class NKIRenderer(Renderer):
         in_index.append(u)
     tid = {u:i for i,u in enumerate(in_index)}   # may be empty: a coord-only kernel (e.g. arange)
 
+    # pure-constant store (no input, no reduce, no coord): e.g. Tensor.full/zeros/ones (gpt2 mask,
+    # KV cache). Const-fold in the runtime -- fill the output buffer directly, no kernel / device needed.
+    def _has_range(u, seen):
+      if u in seen: return False
+      seen.add(u)
+      return u.op is Ops.RANGE or any(_has_range(s, seen) for s in u.src)
+    if not in_index and not reduces and not _has_range(store.src[1], set()):
+      def _ceval(u):
+        if u.op is Ops.CONST: return u.arg
+        if u.op is Ops.CAST: return _ceval(u.src[0])
+        raise NotImplementedError(f"NKI constfill: {u.op}")
+      meta = {"kind":"constfill", "out_slot":out_slot, "out_dtype":out_dtype, "value":float(_ceval(store.src[1]))}
+      return f"# TRAINIUM_META {json.dumps(meta)}\n# constfill (filled in the runtime; no kernel)\n"
+
     kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
     # matmul fast path: a sum-reduce of a product of two inputs -> nl.matmul (real tile matmul,
     # not the O(M*N*K) broadcast-materialize). Within NKI limits only; else fall through to generic.
@@ -217,6 +235,9 @@ class NKIRenderer(Renderer):
 
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
+    # A multi-range reduce (contraction over >1 axis) in the generic path would silently drop axes; the
+    # matmul fast path handles the common case (reshape-merged contraction), so guard the rest.
+    if any(len(rd.src) > 2 for rd in ordered): raise NotImplementedError("NKI: multi-range non-matmul reduce")
     canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
     split = len(kept_ranges) if ordered else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
@@ -251,9 +272,12 @@ class NKIRenderer(Renderer):
       reduce_vars[rd] = f"r{i}"
     out_free = 1 if ordered else (int(np.prod(csize[split:])) if split < len(csize) else 1)
     final = self._emit(store.src[1], leaf, ref)
-    # coordinate-as-value (arange etc.) is supported for elementwise kernels; coords interacting with
-    # a reduce need per-reduce placement (fused attention) -- not handled, so raise instead of silently wrong.
-    if coords and ordered: raise NotImplementedError("NKI: range-as-value combined with reduce not supported")
+    # coordinate-as-value (arange etc.): fine in an elementwise kernel, and fine inside a reduce when the
+    # coord runs over a REDUCE (free) axis -- it's just another (P,F) tile reduced over F (e.g. argmax =
+    # max over an index arange). A coord over a KEPT axis combined with a reduce is the fused-flash-
+    # attention case (coord and reduce on different axes) which the 2D tile model can't express -> raise.
+    if coords and ordered and any(canonical.index(c) < split for c in coords):
+      raise NotImplementedError("NKI: range-as-value over a kept axis combined with reduce not supported")
     if not in_index and not coords: raise NotImplementedError("NKI renderer: no input access")
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
@@ -270,5 +294,11 @@ class NKIRenderer(Renderer):
     loads = [f"    t{i} = nl.load(in{i})" for i in range(nin)]
     loads += [f"    {cv} = nl.load(in{nin+j})" for j,(r,cv) in enumerate(coords.items())]
     inputs_meta += [{"kind":"iota", "axis":canonical.index(r)} for r in coords]
-    meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "flat":flat, "inputs":inputs_meta}
+    # output address: where the (kept-axis) result lands in the out buffer. For a normal full output this
+    # is contiguous from 0; for assign-into-a-slice (e.g. the KV cache) it has an offset + strides, so the
+    # runtime scatters the result into the slice and preserves the rest of the buffer.
+    oc, oo = _affine(out_index.src[1])
+    meta = {"out_slot":out_slot, "out_dtype":out_dtype, "canonical_sizes":csize, "split":split, "flat":flat,
+            "inputs":inputs_meta, "out_kept":[_rsize(r) for r in kept_ranges],
+            "out_off":oo, "out_strides":[oc.get(r, 0) for r in kept_ranges]}
     return self._source(", ".join(f"in{i}" for i in range(nin + len(coords))), loads + body, meta)
