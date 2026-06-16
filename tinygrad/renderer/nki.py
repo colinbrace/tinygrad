@@ -80,7 +80,12 @@ class NKIRenderer(Renderer):
       if dtypes.is_int(u.dtype):   return repr(int(u.arg))
       return repr(bool(u.arg))
     if u.op is Ops.CAST:   # only a real dtype change needs an nl.copy; same-dtype CAST is a no-op
-      if u.dtype.scalar() != u.src[0].dtype.scalar(): return f"nl.copy({r(u.src[0])}, dtype=nl.{self._npname(u.dtype)})"
+      if u.dtype.scalar() != u.src[0].dtype.scalar():
+        src = r(u.src[0])
+        # float->int must truncate toward zero (tinygrad/C/numpy semantics). nl.copy(dtype=int)
+        # rounds-to-nearest-even on real hardware (the simulator happens to truncate), so trunc first.
+        if dtypes.is_float(u.src[0].dtype) and dtypes.is_int(u.dtype): src = f"nl.trunc({src})"
+        return f"nl.copy({src}, dtype=nl.{self._npname(u.dtype)})"
       return r(u.src[0])
     if u.op is Ops.WHERE:
       tile = lambda s: f"nl.full({ref}.shape, {r(s)}, dtype={ref}.dtype)" if s.op is Ops.CONST else r(s)

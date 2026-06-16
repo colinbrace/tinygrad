@@ -1,9 +1,15 @@
-# Trainium backend (Phase 1a: NKI CPU simulator path, no hardware).
+# Trainium backend. Two execution paths behind DEV=TRAINIUM, sharing the NKIRenderer:
+#   - default: NKI CPU simulator (no hardware)            -- nki.simulate(kernel)(*args)
+#   - TRAINIUM_HW=1: real NeuronCore (Phase 1b)           -- kernel(*args) JIT-compiles to NEFF + runs
 # See scratch/ml/theory/tinygrad-notes/backend_design.md
 import json, os
 import numpy as np
 from tinygrad.device import Compiled, Allocator, Compiler
 from tinygrad.renderer.nki import NKIRenderer
+
+# Phase 1b: when set, run kernels on the real device instead of the CPU simulator. The nki.jit
+# callable compiles to a NEFF and executes on /dev/neuron* when called directly with numpy arrays.
+_HW = os.getenv("TRAINIUM_HW") == "1"
 
 _ALU = {"ADD":lambda a,b:a+b, "MUL":lambda a,b:a*b, "SUB":lambda a,b:a-b, "MAX":np.maximum,
         "FLOORDIV":lambda a,b:a//b, "FLOORMOD":lambda a,b:a%b,
@@ -44,21 +50,43 @@ class TrainiumProgram:
     self.name, self.src = name, lib.decode()
     self.meta = json.loads(self.src.splitlines()[0].split("TRAINIUM_META", 1)[1])
     if os.getenv("NKI_SRC"): print(self.src)
-    ns:dict = {}
-    exec(compile(self.src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
-    self.kernel = ns["kernel"]
+    self.kernel = self._build_kernel(name, self.src)
+
+  @staticmethod
+  def _build_kernel(name:str, src:str):
+    # The sim just needs the callable, so exec'ing the source is enough. The HW compiler frontend,
+    # however, looks the entry function up by source location (AST/linecache), so an exec'd kernel
+    # fails with "entry function not found" -- it must live in a real importable .py file.
+    if not _HW:
+      ns:dict = {}
+      exec(compile(src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
+      return ns["kernel"]
+    import importlib.util, hashlib, tempfile
+    h = hashlib.sha256(src.encode()).hexdigest()[:16]
+    d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"k_{h}.py")
+    if not os.path.exists(path):
+      with open(path, "w") as f: f.write(src)
+    spec = importlib.util.spec_from_file_location(f"tinygrad_nki_k_{h}", path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod.kernel
+
+  def _run(self, *np_args):
+    # one place the two paths diverge: real device vs CPU simulator. numpy in -> numpy out either way.
+    if _HW: return np.asarray(self.kernel(*np_args))
+    import nki
+    return np.asarray(nki.simulate(self.kernel)(*np_args))
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
     if m.get("kind") == "matmul":   # nl.matmul fast path: build A as (K,M), B as (K,N) strided views
-      import nki
       def view(spec, shape):
         d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
         return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
           flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
       args = [view(m["A"], (m["K"], m["M"])), view(m["B"], (m["K"], m["N"]))]
       args += [view(p, (m["M"], m["N"])) for p in m["post"]]   # post-ops (bias etc.) broadcast to (M,N)
-      out = np.asarray(nki.simulate(self.kernel)(*args))
+      out = self._run(*args)
       bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
       return None
     # Build each input INDEX as a strided view over the canonical iteration space: full size on
@@ -86,15 +114,13 @@ class TrainiumProgram:
         shape = [cs[c] if (c < split or st[c] != 0) else 1 for c in range(nd)]
         view = np.lib.stride_tricks.as_strided(flat[inp["offset"]:], shape=shape, strides=[st[c]*d.itemsize for c in range(nd)])
       in_arrs.append(np.ascontiguousarray(view).reshape(P, int(np.prod(shape[split:])) or 1))
-    if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} via nki.simulate, in={[a.shape for a in in_arrs]}")
-    import nki
+    if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} {'on HW' if _HW else 'via nki.simulate'}, in={[a.shape for a in in_arrs]}")
     # NKI partition dim (axis 0) is capped at 128 -> tile the kernel call into <=128-row chunks
     PMAX, rows = 128, in_arrs[0].shape[0]
     if rows <= PMAX:
-      out = np.asarray(nki.simulate(self.kernel)(*in_arrs))
+      out = self._run(*in_arrs)
     else:
-      out = np.concatenate([np.asarray(nki.simulate(self.kernel)(*[a[i:i+PMAX] for a in in_arrs]))
-                            for i in range(0, rows, PMAX)], axis=0)
+      out = np.concatenate([self._run(*[a[i:i+PMAX] for a in in_arrs]) for i in range(0, rows, PMAX)], axis=0)
     bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
     return None
 
