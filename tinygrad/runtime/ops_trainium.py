@@ -55,8 +55,8 @@ class TrainiumAllocator(Allocator['TrainiumDevice']):
   def _copyout(self, dest:memoryview, src): dest[:] = src
 
 class TrainiumProgram:
-  def __init__(self, name:str, lib:bytes, *aux, runtimevars=None, prg=None, **kwargs):
-    self.name, self.src = name, lib.decode()
+  def __init__(self, name:str, lib:bytes, *aux, runtimevars=None, prg=None, core_id:int=0, **kwargs):
+    self.name, self.src, self.core_id = name, lib.decode(), core_id   # core_id: which NeuronCore (multi-core)
     self.meta = json.loads(self.src.splitlines()[0].split("TRAINIUM_META", 1)[1])
     self._srchash = hashlib.sha256(self.src.encode()).hexdigest()[:16]
     if os.getenv("NKI_SRC"): print(self.src)
@@ -133,7 +133,7 @@ class TrainiumProgram:
       return np.asarray(nki.simulate(self.kernel)(*np_args))
     if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
     compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
-    res = compiled.run(**dict(zip(names, np_args)))
+    res = compiled.run(**dict(zip(names, np_args)))                # core 0: the well-tested high-level run
     return np.asarray(next(iter(res.outputs.values())))
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
@@ -229,4 +229,9 @@ class TrainiumProgram:
 
 class TrainiumDevice(Compiled):
   def __init__(self, device:str):
-    super().__init__(device, TrainiumAllocator(self), [NKIRenderer], TrainiumProgram)
+    import functools
+    # multi-core: "TRAINIUM" / "TRAINIUM:0" -> core 0, "TRAINIUM:N" -> core N. tinygrad shards across
+    # TRAINIUM:0..3; each device runs its kernels on its own NeuronCore (load_from_neff core_id).
+    core_id = int(device.split(":")[1]) if ":" in device else 0
+    super().__init__(device, TrainiumAllocator(self), [NKIRenderer],
+                     functools.partial(TrainiumProgram, core_id=core_id))
