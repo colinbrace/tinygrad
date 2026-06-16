@@ -15,8 +15,10 @@ _SIMPLE_LAUNCH = os.getenv("TRAINIUM_SIMPLE_LAUNCH") == "1"   # opt out of the p
 
 # built kernel callables keyed by source hash; see TrainiumProgram._build_kernel for why this matters
 _KERNEL_CACHE:dict = {}
-# persistent CompiledKernel (loaded NEFF) keyed by (src_hash, arg signature); see _compiled_for
+# in-process CompiledKernel (loaded NEFF) keyed by (src_hash, arg signature); see _compiled_for
 _COMPILED_CACHE:dict = {}
+# cross-process on-disk NEFF cache root: a fresh process reuses an existing kernel.neff (skips neuron-cc)
+_NEFF_CACHE_DIR = os.getenv("TRAINIUM_NEFF_CACHE", os.path.join(tempfile.gettempdir(), "tinygrad_nki_neff"))
 
 _ALU = {"ADD":lambda a,b:a+b, "MUL":lambda a,b:a*b, "SUB":lambda a,b:a-b, "MAX":np.maximum,
         "FLOORDIV":lambda a,b:a//b, "FLOORMOD":lambda a,b:a%b,
@@ -91,26 +93,36 @@ class TrainiumProgram:
   def _compiled_for(self, np_args):
     # Build (once) and cache a CompiledKernel specialized to these args' shapes/dtypes. The loaded NEFF
     # lives on CompiledKernel._model (lazy, loaded on first .run), so caching this object turns the per
-    # call cost from "reload NEFF + re-init runtime" (~1.2s) into "launch" (~0.2ms). neuron-cc requires
-    # a CLEAN output dir, so each (kernel, signature) gets its own freshly-emptied artifacts dir.
+    # call cost from "reload NEFF + re-init runtime" (~1.2s) into "launch" (~0.2ms).
+    # Two cache levels: in-process (_COMPILED_CACHE) and on-disk by (src_hash, sig). On a disk hit a fresh
+    # process recomputes only the cheap `bir` (needed for run()) and reuses the cached kernel.neff,
+    # skipping neuron-cc (~1.2s -> ~0.1s). neuron-cc requires a CLEAN output dir, so a miss compiles into
+    # a freshly-emptied per-(kernel,signature) dir.
     sig = tuple((tuple(a.shape), a.dtype.str) for a in np_args)
-    if (hit := _COMPILED_CACHE.get((self._srchash, sig))) is not None: return hit
+    key = (self._srchash, sig)
+    if (hit := _COMPILED_CACHE.get(key)) is not None: return hit
     from dataclasses import replace
     from nki.framework.compiled import StandaloneKernel
     from nki.compiler.driver import compile_to_bir
-    from nki.compiler.ncc_driver import compile_bir_to_neff
+    from nki.compiler.ncc_driver import compile_bir_to_neff, CompiledKernel
     sk = self.kernel._to_subclass(StandaloneKernel)
     inputs = dict(sk._bind_args(np_args, {}))                          # {param_name: ndarray}
+    frontend = sk._frontend_cls(enable_backend_opt=sk._enable_backend_opt)
     sighash = hashlib.sha256(repr(sig).encode()).hexdigest()[:16]      # stable per-signature dir (no hash collisions)
-    d = os.path.join(tempfile.gettempdir(), "tinygrad_nki_neff", f"{self._srchash}_{sighash}")
-    shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
-    copts = replace(sk._compile_opts(), artifacts_dir=d, output_path=os.path.join(d, "kernel.neff"))
-    bir = compile_to_bir(sk, frontend=sk._frontend_cls(enable_backend_opt=sk._enable_backend_opt),
-                         inputs=inputs, compile_opts=copts)
-    compiled = compile_bir_to_neff(copts, bir, input_arrays=[],
-                                   argument_names=[s.name for s in bir.descriptor.input_specs],
-                                   output_arg_names=[s.name for s in bir.descriptor.output_specs])
-    _COMPILED_CACHE[(self._srchash, sig)] = (hit := (compiled, list(inputs.keys())))
+    cdir = os.path.join(_NEFF_CACHE_DIR, f"{self._srchash}_{sighash}"); neff = os.path.join(cdir, "kernel.neff")
+    if os.path.exists(neff):    # cross-process disk hit: skip neuron-cc, recompute bir into a throwaway dir
+      tmp = tempfile.mkdtemp(prefix="tinygrad_nki_bir_")
+      copts = replace(sk._compile_opts(), artifacts_dir=tmp, output_path=os.path.join(tmp, "kernel.neff"))
+      bir = compile_to_bir(sk, frontend=frontend, inputs=inputs, compile_opts=copts)
+      compiled = CompiledKernel(neff_path=neff, target=copts.target, lnc=copts.lnc, artifacts_dir=tmp, bir=bir)
+    else:                       # miss: full compile into a clean persistent dir
+      shutil.rmtree(cdir, ignore_errors=True); os.makedirs(cdir)
+      copts = replace(sk._compile_opts(), artifacts_dir=cdir, output_path=neff)
+      bir = compile_to_bir(sk, frontend=frontend, inputs=inputs, compile_opts=copts)
+      compiled = compile_bir_to_neff(copts, bir, input_arrays=[],
+                                     argument_names=[s.name for s in bir.descriptor.input_specs],
+                                     output_arg_names=[s.name for s in bir.descriptor.output_specs])
+    _COMPILED_CACHE[key] = (hit := (compiled, list(inputs.keys())))
     return hit
 
   def _run(self, *np_args):
