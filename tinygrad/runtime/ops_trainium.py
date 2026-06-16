@@ -1,18 +1,22 @@
 # Trainium backend. Two execution paths behind DEV=TRAINIUM, sharing the NKIRenderer:
-#   - default: NKI CPU simulator (no hardware)            -- nki.simulate(kernel)(*args)
-#   - TRAINIUM_HW=1: real NeuronCore (Phase 1b)           -- kernel(*args) JIT-compiles to NEFF + runs
+#   - default: NKI CPU simulator (no hardware)   -- nki.simulate(kernel)(*args)
+#   - TRAINIUM_HW=1: real NeuronCore (Phase 1b). By default uses a PERSISTENT EXECUTABLE: compile each
+#     kernel+signature to a NEFF once, load it onto the device once, then launch many (warm launch is
+#     ~0.2ms vs ~1.2s for the high-level kernel(*args) path, which reloads the NEFF every call).
+#     TRAINIUM_SIMPLE_LAUNCH=1 forces the simpler high-level path (more stable, much slower).
 # See scratch/ml/theory/tinygrad-notes/backend_design.md
-import json, os
+import json, os, tempfile, shutil, hashlib
 import numpy as np
 from tinygrad.device import Compiled, Allocator, Compiler
 from tinygrad.renderer.nki import NKIRenderer
 
-# Phase 1b: when set, run kernels on the real device instead of the CPU simulator. The nki.jit
-# callable compiles to a NEFF and executes on /dev/neuron* when called directly with numpy arrays.
 _HW = os.getenv("TRAINIUM_HW") == "1"
+_SIMPLE_LAUNCH = os.getenv("TRAINIUM_SIMPLE_LAUNCH") == "1"   # opt out of the persistent-executable path
 
 # built kernel callables keyed by source hash; see TrainiumProgram._build_kernel for why this matters
 _KERNEL_CACHE:dict = {}
+# persistent CompiledKernel (loaded NEFF) keyed by (src_hash, arg signature); see _compiled_for
+_COMPILED_CACHE:dict = {}
 
 _ALU = {"ADD":lambda a,b:a+b, "MUL":lambda a,b:a*b, "SUB":lambda a,b:a-b, "MAX":np.maximum,
         "FLOORDIV":lambda a,b:a//b, "FLOORMOD":lambda a,b:a%b,
@@ -52,12 +56,12 @@ class TrainiumProgram:
   def __init__(self, name:str, lib:bytes, *aux, runtimevars=None, prg=None, **kwargs):
     self.name, self.src = name, lib.decode()
     self.meta = json.loads(self.src.splitlines()[0].split("TRAINIUM_META", 1)[1])
+    self._srchash = hashlib.sha256(self.src.encode()).hexdigest()[:16]
     if os.getenv("NKI_SRC"): print(self.src)
     self.kernel = self._build_kernel(name, self.src)
 
   @staticmethod
   def _build_kernel(name:str, src:str):
-    import hashlib
     h = hashlib.sha256(src.encode()).hexdigest()[:16]
     # Cache the kernel CALLABLE by source hash. nki.jit's NEFF compile-cache lives ON the function
     # object (func._nki_compile_cache), so a stable func per unique source lets every realization
@@ -73,7 +77,7 @@ class TrainiumProgram:
       exec(compile(src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
       kernel = ns["kernel"]
     else:
-      import importlib.util, tempfile
+      import importlib.util
       d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
       path = os.path.join(d, f"k_{h}.py")
       if not os.path.exists(path):
@@ -84,11 +88,40 @@ class TrainiumProgram:
     _KERNEL_CACHE[h] = kernel
     return kernel
 
+  def _compiled_for(self, np_args):
+    # Build (once) and cache a CompiledKernel specialized to these args' shapes/dtypes. The loaded NEFF
+    # lives on CompiledKernel._model (lazy, loaded on first .run), so caching this object turns the per
+    # call cost from "reload NEFF + re-init runtime" (~1.2s) into "launch" (~0.2ms). neuron-cc requires
+    # a CLEAN output dir, so each (kernel, signature) gets its own freshly-emptied artifacts dir.
+    sig = tuple((tuple(a.shape), a.dtype.str) for a in np_args)
+    if (hit := _COMPILED_CACHE.get((self._srchash, sig))) is not None: return hit
+    from dataclasses import replace
+    from nki.framework.compiled import StandaloneKernel
+    from nki.compiler.driver import compile_to_bir
+    from nki.compiler.ncc_driver import compile_bir_to_neff
+    sk = self.kernel._to_subclass(StandaloneKernel)
+    inputs = dict(sk._bind_args(np_args, {}))                          # {param_name: ndarray}
+    sighash = hashlib.sha256(repr(sig).encode()).hexdigest()[:16]      # stable per-signature dir (no hash collisions)
+    d = os.path.join(tempfile.gettempdir(), "tinygrad_nki_neff", f"{self._srchash}_{sighash}")
+    shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+    copts = replace(sk._compile_opts(), artifacts_dir=d, output_path=os.path.join(d, "kernel.neff"))
+    bir = compile_to_bir(sk, frontend=sk._frontend_cls(enable_backend_opt=sk._enable_backend_opt),
+                         inputs=inputs, compile_opts=copts)
+    compiled = compile_bir_to_neff(copts, bir, input_arrays=[],
+                                   argument_names=[s.name for s in bir.descriptor.input_specs],
+                                   output_arg_names=[s.name for s in bir.descriptor.output_specs])
+    _COMPILED_CACHE[(self._srchash, sig)] = (hit := (compiled, list(inputs.keys())))
+    return hit
+
   def _run(self, *np_args):
     # one place the two paths diverge: real device vs CPU simulator. numpy in -> numpy out either way.
-    if _HW: return np.asarray(self.kernel(*np_args))
-    import nki
-    return np.asarray(nki.simulate(self.kernel)(*np_args))
+    if not _HW:
+      import nki
+      return np.asarray(nki.simulate(self.kernel)(*np_args))
+    if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
+    compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
+    res = compiled.run(**dict(zip(names, np_args)))
+    return np.asarray(next(iter(res.outputs.values())))
 
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     m = self.meta
