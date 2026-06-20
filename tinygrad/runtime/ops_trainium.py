@@ -12,6 +12,11 @@ from tinygrad.renderer.nki import NKIRenderer
 
 _HW = os.getenv("TRAINIUM_HW") == "1"
 _SIMPLE_LAUNCH = os.getenv("TRAINIUM_SIMPLE_LAUNCH") == "1"   # opt out of the persistent-executable path
+_NO_RESIDENT = os.getenv("TRAINIUM_NO_RESIDENT") == "1"       # opt out of on-core weight residency (Goal 3)
+
+# [Goal 3] residency stats, for verification: from_numpy (host->device DMA) count vs cache reuse count.
+# A weight should DMA once and then only ever be reused, no matter how many forward passes run.
+_RESIDENT_STATS = {"dma": 0, "reuse": 0}
 
 # built kernel callables keyed by source hash; see TrainiumProgram._build_kernel for why this matters
 _KERNEL_CACHE:dict = {}
@@ -41,7 +46,7 @@ def _eval_index(node, shape, bufs):
     return np.where(c, a, b)
   if t == "load":   # gated load: out-of-bounds (Invalid) index -> 0
     sub = _eval_index(node["s"][0], shape, bufs).astype(np.int64)
-    buf = np.frombuffer(bufs[node["slot"]], dtype=np.dtype(node["dtype"]))
+    buf = np.frombuffer(bufs[node["slot"]].host, dtype=np.dtype(node["dtype"]))
     valid = (sub >= 0) & (sub < len(buf))
     return np.where(valid, buf[np.clip(sub, 0, len(buf)-1)], 0).astype(np.int64)
   if t == "alu": return _ALU[node["op"]](*[_eval_index(x, shape, bufs) for x in node["s"]])
@@ -51,10 +56,23 @@ class TrainiumCompiler(Compiler):
   # SIM path: pass the rendered NKI source through as bytes. (HW path later: neuron-cc -> NEFF.)
   def compile(self, src:str) -> bytes: return src.encode()
 
+class TrainiumBuffer:
+  # [Goal 3] The allocator opaque, enriched from a bare memoryview to {host bytes + version + per-core
+  # device-tensor cache}. `ver` bumps on EVERY host-side write (copyin / kernel writeback / constfill);
+  # `dev` caches on-NeuronCore SpikeTensors keyed by (core, param_name, view-signature) together with the
+  # `ver` they were DMA'd at. A read-only weight is copyin'd once -> ver never moves again -> its device
+  # tensor is DMA'd once and reused across every forward pass (on-core residency). An activation/output is
+  # rewritten each pass -> ver bumps -> its stale cache entry is rejected and it is correctly re-DMA'd.
+  __slots__ = ("host", "ver", "dev", "dmas")
+  def __init__(self, size:int): self.host = memoryview(bytearray(size)); self.ver = 0; self.dev = {}; self.dmas = 0
+  def __len__(self): return len(self.host)
+  def write(self, mv): self.host[:] = mv; self.ver += 1   # any host->buffer write invalidates resident copies
+
 class TrainiumAllocator(Allocator['TrainiumDevice']):
-  def _alloc(self, size, options): return memoryview(bytearray(size))
-  def _copyin(self, dest, src:memoryview): dest[:] = src
-  def _copyout(self, dest:memoryview, src): dest[:] = src
+  def _alloc(self, size, options): return TrainiumBuffer(size)
+  def _copyin(self, dest, src:memoryview): dest.write(src)
+  def _copyout(self, dest:memoryview, src): dest[:] = src.host
+  def _as_buffer(self, src) -> memoryview: return src.host   # zero-copy view (DISK copies / as_memoryview)
 
 class TrainiumProgram:
   def __init__(self, name:str, lib:bytes, *aux, runtimevars=None, prg=None, core_id:int=0, **kwargs):
@@ -128,29 +146,42 @@ class TrainiumProgram:
     _COMPILED_CACHE[key] = (hit := (compiled, list(inputs.keys())))
     return hit
 
-  def _run(self, *np_args):
+  def _run(self, *np_args, srcs=None):
     # one place the two paths diverge: real device vs CPU simulator. numpy in -> numpy out either way.
+    # `srcs` is a per-arg list (or None) of (TrainiumBuffer, view-signature) used for on-core weight
+    # residency [Goal 3]; None entries (synthetic/sliced args) are always re-DMA'd. The sim and the
+    # high-level core-0 paths ignore it.
     if not _HW:
       import nki
       return np.asarray(nki.simulate(self.kernel)(*np_args))
     if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
     compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
-    if self.core_id != 0: return self._run_on_core(compiled, names, np_args)   # multi-core: target this core
-    res = compiled.run(**dict(zip(names, np_args)))                # core 0: the well-tested high-level run
-    return np.asarray(next(iter(res.outputs.values())))
+    if _NO_RESIDENT and self.core_id == 0:                         # legacy path: well-tested high-level run, no residency
+      res = compiled.run(**dict(zip(names, np_args)))
+      return np.asarray(next(iter(res.outputs.values())))
+    return self._run_on_core(compiled, names, np_args, None if _NO_RESIDENT else srcs)
 
-  def _run_on_core(self, compiled, names, np_args):
+  def _run_on_core(self, compiled, names, np_args, srcs=None):
     # Run a cached NEFF on a SPECIFIC NeuronCore. The high-level CompiledKernel.run() / _ensure_loaded()
     # hardcode core 0 (SpikeModel.load_from_neff(neff_path) with the default core_id=0), so for core N we
     # load our own SpikeModel with core_id=N and place every I/O SpikeTensor on core N. The loaded model
     # is cached per (kernel, signature, core) and reused, so repeat launches are just DMA + execute.
-    # This mirrors CompiledKernel.run() exactly (from_numpy inputs, prepare_outputs, model(in, outputs=)),
-    # only threading core_id throughout.
+    # This mirrors CompiledKernel.run() (from_numpy inputs, prepare_outputs, model(in, outputs=)), threading
+    # core_id throughout, PLUS [Goal 3] on-core residency: when an input's source buffer is unchanged
+    # (same ver) since its last DMA we reuse the resident SpikeTensor instead of re-DMA'ing it. Kernels
+    # never write their inputs (the renderer emits separate output tensors), so reusing an input is safe.
     from nki.runtime import SpikeModel, SpikeTensor
     key = (self._srchash, tuple((tuple(a.shape), a.dtype.str) for a in np_args), self.core_id)
     if (model := _MODEL_CACHE.get(key)) is None:
       model = _MODEL_CACHE[key] = SpikeModel.load_from_neff(compiled.neff_path, core_id=self.core_id)
-    si = {n: SpikeTensor.from_numpy(np.ascontiguousarray(a), n, core_id=self.core_id) for n, a in zip(names, np_args)}
+    if srcs is None: srcs = [None]*len(np_args)
+    si = {}
+    for n, a, s in zip(names, np_args, srcs):
+      ck = (self.core_id, n, s[1]) if s is not None else None      # cache key: core + param name + view sig
+      if s is not None and (hit := s[0].dev.get(ck)) is not None and hit[1] == s[0].ver:
+        si[n] = hit[0]; _RESIDENT_STATS["reuse"] += 1; continue    # resident: skip the host->device DMA
+      si[n] = SpikeTensor.from_numpy(np.ascontiguousarray(a), n, core_id=self.core_id); _RESIDENT_STATS["dma"] += 1
+      if s is not None: s[0].dev[ck] = (si[n], s[0].ver); s[0].dmas += 1   # remember this resident copy; count DMAs of this buffer
     so = {n: SpikeTensor.from_numpy(v, n, core_id=self.core_id) for n, v in compiled.prepare_outputs().items()}
     model(si, outputs=so)
     return np.asarray(next(iter(so.values())).numpy())
@@ -159,46 +190,52 @@ class TrainiumProgram:
     m = self.meta
     if m.get("kind") == "constfill":   # pure-constant tensor (Tensor.full/zeros/ones): fill in numpy, no device
       d = np.dtype(m["out_dtype"]); n = len(bufs[m["out_slot"]]) // d.itemsize
-      bufs[m["out_slot"]][:] = np.full(n, m["value"], dtype=d).tobytes()
+      bufs[m["out_slot"]].write(np.full(n, m["value"], dtype=d).tobytes())
       return None
     if m.get("kind") == "matmul":   # nc_matmul fast path: build A as (Bp,K,M), B as (Bp,K,N) strided views
       batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1; Ksizes = m["Ksizes"]
-      def view(spec, shape):
+      def view(spec, shape, role):
         # strides come from the renderer (0 on a batch axis = broadcast that operand). The contraction may
         # span >1 axis (Ksizes), e.g. a reshape merging heads*head_dim -- materialize then flatten below.
-        d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]], dtype=d)
-        return np.ascontiguousarray(np.lib.stride_tricks.as_strided(
+        d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]].host, dtype=d)
+        arr = np.ascontiguousarray(np.lib.stride_tricks.as_strided(
           flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
-      args = [view(m["A"], (*batch, *Ksizes, m["M"])).reshape(Bp, m["K"], m["M"]),
-              view(m["B"], (*batch, *Ksizes, m["N"])).reshape(Bp, m["K"], m["N"])]
-      args += [view(p, (*batch, m["M"], m["N"])).reshape(Bp, m["M"], m["N"]) for p in m["post"]]  # -> (Bp,M,N)
-      out = self._run(*args)                                    # kernel returns (Bp, M, N)
-      bufs[m["out_slot"]][:] = np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes()
+        # [Goal 3] residency source: a matmul operand is overwhelmingly a weight (read-only, stable) -> a
+        # contiguous K-major view identified by (role, offset, strides, shape) is DMA'd once and resident.
+        src = (bufs[spec["param_slot"]], (role, spec["offset"], tuple(spec["strides"]), tuple(shape)))
+        return arr, src
+      built = [view(m["A"], (*batch, *Ksizes, m["M"]), "A"), view(m["B"], (*batch, *Ksizes, m["N"]), "B")]
+      built += [view(p, (*batch, m["M"], m["N"]), f"P{i}") for i, p in enumerate(m["post"])]
+      args = [built[0][0].reshape(Bp, m["K"], m["M"]), built[1][0].reshape(Bp, m["K"], m["N"])]
+      args += [b[0].reshape(Bp, m["M"], m["N"]) for b in built[2:]]   # -> (Bp,M,N)
+      out = self._run(*args, srcs=[b[1] for b in built])           # kernel returns (Bp, M, N)
+      bufs[m["out_slot"]].write(np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes())
       return None
     # Build each input INDEX as a strided view over the canonical iteration space: full size on
     # PARTITION (kept) axes, natural size on FREE axes (1 where stride is 0). A 0 stride broadcasts,
     # a nonzero stride + offset reads contiguous/transpose/slice -- all uniformly. Then reshape (P, F).
     cs, split, nd = m["canonical_sizes"], m["split"], len(m["canonical_sizes"])
     P = int(np.prod(cs[:split])) if split else 1
-    in_arrs = []
+    in_arrs = []; srcs = []   # srcs[i] = (buffer, view-sig) for residency, or None (synthetic/non-affine)
     for inp in m["inputs"]:
       if inp["kind"] == "iota":   # a RANGE used as a value -> coordinate of canonical axis over the grid
         ax = inp["axis"]
         sh = [1]*nd; sh[ax] = cs[ax]
         coord = np.arange(cs[ax]).reshape(sh) + np.zeros(cs, dtype=np.int64)   # broadcast to full grid
-        in_arrs.append(coord.reshape(P, int(np.prod(cs[split:])) or 1).astype(np.float32))
+        in_arrs.append(coord.reshape(P, int(np.prod(cs[split:])) or 1).astype(np.float32)); srcs.append(None)
         continue
       d = np.dtype(inp["dtype"])
-      flat = np.frombuffer(bufs[inp["param_slot"]], dtype=d)
+      flat = np.frombuffer(bufs[inp["param_slot"]].host, dtype=d)
       if inp["kind"] == "gather":   # data-dependent index: eval offsets over the grid, then gather
         idx = _eval_index(inp["index"], cs, bufs)
         valid = (idx >= 0) & (idx < len(flat))      # gated load: Invalid/OOB index -> 0 (e.g. cat/pad)
         view = np.where(valid, flat[np.clip(idx, 0, len(flat)-1)], 0)
-        shape = cs
+        shape = cs; srcs.append(None)               # data-dependent -> not safely resident
       else:                         # affine: a strided view (full partition, natural free)
         st = inp["strides"]
         shape = [cs[c] if (c < split or st[c] != 0) else 1 for c in range(nd)]
         view = np.lib.stride_tricks.as_strided(flat[inp["offset"]:], shape=shape, strides=[st[c]*d.itemsize for c in range(nd)])
+        srcs.append((bufs[inp["param_slot"]], ("ew", inp["offset"], tuple(st), tuple(shape))))
       in_arrs.append(np.ascontiguousarray(view).reshape(P, int(np.prod(shape[split:])) or 1))
     if os.getenv("NKI_TRACE"): print(f"[trainium] {self.name} {'on HW' if _HW else 'via nki.simulate'}, in={[a.shape for a in in_arrs]}")
     PMAX, FMAX, FFLAT = 128, 4096, 8192   # partition cap 128; free chunk for SBUF; (1,N) is safe up to FFLAT
@@ -210,7 +247,7 @@ class TrainiumProgram:
       # fail MLIR verification for fp16.)
       N = max(a.shape[1] for a in in_arrs)
       if N <= FFLAT:
-        out = self._run(*in_arrs)
+        out = self._run(*in_arrs, srcs=srcs)      # full (1,N) views -> residency keys stay valid
       else:
         Pn = min(PMAX, N); F = -(-N // Pn); pad = Pn*F - N
         def spread(a):
@@ -225,8 +262,8 @@ class TrainiumProgram:
     else:
       rows = in_arrs[0].shape[0]
       if rows <= PMAX:
-        out = self._run(*in_arrs)
-      else:
+        out = self._run(*in_arrs, srcs=srcs)      # un-tiled: full views -> residency keys stay valid
+      else:                                       # tiled over partitions: args are row-slices, so re-DMA each
         out = np.concatenate([self._run(*[a[i:i+PMAX] for a in in_arrs]) for i in range(0, rows, PMAX)], axis=0)
     self._writeback(bufs, m, out)
     return None
@@ -241,10 +278,10 @@ class TrainiumProgram:
     kept, off, ostr = m["out_kept"], m["out_off"], m["out_strides"]
     contig = ostr == [int(np.prod(kept[i+1:])) for i in range(len(kept))]
     if off == 0 and val.size == nbuf and contig:
-      bufs[slot][:] = val.tobytes(); return
-    full = np.frombuffer(bufs[slot], dtype=d).copy()
+      bufs[slot].write(val.tobytes()); return     # write() bumps ver so any resident copy of this buffer is dropped
+    full = np.frombuffer(bufs[slot].host, dtype=d).copy()
     np.lib.stride_tricks.as_strided(full[off:], shape=kept, strides=[s*d.itemsize for s in ostr])[...] = val.reshape(kept)
-    bufs[slot][:] = full.tobytes()
+    bufs[slot].write(full.tobytes())
 
 class TrainiumDevice(Compiled):
   def __init__(self, device:str):
