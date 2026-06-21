@@ -21,6 +21,7 @@ NL_BINOP = {Ops.ADD:"nl.add", Ops.MUL:"nl.multiply", Ops.SUB:"nl.subtract",
 NL_UNOP  = {Ops.NEG:"nl.negative", Ops.SQRT:"nl.sqrt", Ops.RECIPROCAL:"nl.reciprocal",
             Ops.SIN:"nl.sin"}
 NL_REDUCE = {Ops.ADD:"nl.sum", Ops.MAX:"nl.max", Ops.MUL:"nl.prod"}
+NL_BOOL = {Ops.AND:"and", Ops.OR:"or", Ops.XOR:"xor"}   # logical_* for bool, bitwise_* for int (see _emit)
 LN2 = 0.6931471805599453
 
 def _affine(u:UOp) -> tuple[dict, int]:
@@ -92,7 +93,9 @@ class NKIRenderer(Renderer):
   disable_opts = True          # tile machine: skip tinygrad's scalar-loop opts (UPCAST/...)
   render_high_level = True     # consume Ops.REDUCE / ALU / INDEX before scalar lowering
 
-  def _npname(self, dt) -> str: return np.dtype(_to_np_dtype(dt.scalar())).name
+  def _npname(self, dt) -> str:
+    name = np.dtype(_to_np_dtype(dt.scalar())).name
+    return "float32" if name == "float64" else name   # NKI/Trainium has no float64 -> compute in float32
 
   # shared expression emitter; `leaf(u)` resolves INDEX/REDUCE leaves to tile var names
   def _emit(self, u:UOp, leaf, ref:str) -> str:
@@ -119,6 +122,11 @@ class NKIRenderer(Renderer):
     if u.op is Ops.MULACC: return f"nl.add(nl.multiply({r(u.src[0])}, {r(u.src[1])}), {r(u.src[2])})"
     if u.op is Ops.EXP2: return f"nl.exp(nl.multiply({r(u.src[0])}, {LN2!r}))"
     if u.op is Ops.LOG2: return f"nl.multiply(nl.log({r(u.src[0])}), {1.0/LN2!r})"
+    if u.op is Ops.FLOORMOD: return f"nl.mod({r(u.src[0])}, {r(u.src[1])})"
+    if u.op is Ops.FLOORDIV: return f"nl.floor(nl.divide({r(u.src[0])}, {r(u.src[1])}))"
+    if u.op in NL_BOOL:   # boolean masks (xent one-hot) use logical_*; integer bitwise uses bitwise_*
+      pre = "logical" if u.dtype == dtypes.bool else "bitwise"
+      return f"nl.{pre}_{NL_BOOL[u.op]}({r(u.src[0])}, {r(u.src[1])})"
     if u.op in NL_BINOP: return f"{NL_BINOP[u.op]}({r(u.src[0])}, {r(u.src[1])})"
     if u.op in NL_UNOP:  return f"{NL_UNOP[u.op]}({r(u.src[0])})"
     raise NotImplementedError(f"NKI renderer: unhandled op {u.op}")
@@ -260,10 +268,15 @@ class NKIRenderer(Renderer):
   def _render_generic(self, store, out_index, out_slot, out_dtype, in_index, ordered, kept_ranges) -> str:
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
-    # A multi-range reduce (contraction over >1 axis) in the generic path would silently drop axes; the
-    # matmul fast path handles the common case (reshape-merged contraction), so guard the rest.
-    if any(len(rd.src) > 2 for rd in ordered): raise NotImplementedError("NKI: multi-range non-matmul reduce")
-    canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
+    # A reduce may span >1 range -- conv (sum over cin,kh,kw) and pooling (max over ph,pw) reduce over a
+    # whole window. For a SINGLE reduce we flatten all its ranges into the free dim and reduce the whole
+    # free (correct: it IS one reduce over all those axes). For MULTIPLE reduces, mixing their ranges in one
+    # free dim would cross-reduce them, so keep one-free-axis-per-reduce and guard multi-range there.
+    if len(ordered) == 1:
+      canonical = kept_ranges + list(ordered[0].src[1:])      # one reduce: all its ranges form the free dim
+    else:
+      if any(len(rd.src) > 2 for rd in ordered): raise NotImplementedError("NKI: multi-range reduce with multiple reduces")
+      canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
     split = len(kept_ranges) if ordered else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
     tid = {u:i for i,u in enumerate(in_index)}   # input INDEX -> tile var index (may be empty: coord-only)
