@@ -117,7 +117,13 @@ class NKIRenderer(Renderer):
         return f"nl.copy({src}, dtype=nl.{self._npname(u.dtype)})"
       return r(u.src[0])
     if u.op is Ops.WHERE:
-      tile = lambda s: f"nl.full({ref}.shape, {r(s)}, dtype={ref}.dtype)" if s.op is Ops.CONST else r(s)
+      # a CONST branch -> a full tile matching the WHERE's RESULT dtype and the NON-CONST branch's SHAPE.
+      # (Using ref is unreliable: ref/t0 may be the bool mask -> wrong dtype, or a reduced (P,1) tile -> the
+      # fill wouldn't broadcast against the (P,F) data. The non-const branch carries the real (P,F) shape.)
+      wd = f"nl.{self._npname(u.dtype)}"
+      nonconst = u.src[2] if u.src[1].op is Ops.CONST else u.src[1]
+      sref = r(nonconst) if nonconst.op is not Ops.CONST else f"{ref}"   # both-const: fall back to ref
+      tile = lambda s: f"nl.full(({sref}).shape, {r(s)}, dtype={wd})" if s.op is Ops.CONST else r(s)
       return f"nl.where({r(u.src[0])}, {tile(u.src[1])}, {tile(u.src[2])})"
     if u.op is Ops.MULACC: return f"nl.add(nl.multiply({r(u.src[0])}, {r(u.src[1])}), {r(u.src[2])})"
     if u.op is Ops.EXP2: return f"nl.exp(nl.multiply({r(u.src[0])}, {LN2!r}))"
@@ -315,8 +321,14 @@ class NKIRenderer(Renderer):
     # coord runs over a REDUCE (free) axis -- it's just another (P,F) tile reduced over F (e.g. argmax =
     # max over an index arange). A coord over a KEPT axis combined with a reduce is the fused-flash-
     # attention case (coord and reduce on different axes) which the 2D tile model can't express -> raise.
-    if coords and ordered and any(canonical.index(c) < split for c in coords):
-      raise NotImplementedError("NKI: range-as-value over a kept axis combined with reduce not supported")
+    # A coordinate over a KEPT axis combined with a reduce is a 2D mask g(kept_coord, reduce_coord) applied
+    # elementwise then reduced -- e.g. a causal-attention mask. That IS expressible and correct in the tile
+    # model (the kept-axis coord is a (P,F) tile constant over the reduce axis). BUT when the kernel also has
+    # a GATHER (data-dependent index, e.g. maxpool / conv input-gradient), the coord entangles with the
+    # gather offsets and the 2D-tile model renders it WRONG -> reject those (Phase 2 structured kernels).
+    has_gather = any(im.get("kind") == "gather" for im in inputs_meta)
+    if coords and ordered and has_gather and any(canonical.index(c) < split for c in coords):
+      raise NotImplementedError("NKI: coord over a kept axis + reduce + gather not supported (needs a structured kernel)")
     if not in_index and not coords: raise NotImplementedError("NKI renderer: no input access")
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
