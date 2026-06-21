@@ -3,6 +3,11 @@
 # before tinygrad lowers reduce into a scalar accumulator loop -- see the
 # render_high_level hook in codegen/__init__.py). NKI is a tile-op machine, so we
 # map high-level ops directly: ALU -> nl.*, Ops.REDUCE -> nl.sum/nl.max.
+#
+# render() parses the UOp graph once, then dispatches on the kernel's SHAPE to one of three emitters:
+#   constfill  -- a pure-constant store (no inputs, no reduce): filled in the runtime, no kernel
+#   matmul     -- a sum-of-products of two inputs: a tiled nl.matmul (nc_matmul) fast path
+#   generic    -- everything else: a unified iteration-space elementwise / reduce / gather kernel
 # See scratch/ml/theory/tinygrad-notes/backend_design.md.
 import os, json, math
 import numpy as np
@@ -38,6 +43,25 @@ def _affine(u:UOp) -> tuple[dict, int]:
 
 def _rsize(r:UOp) -> int: return int(r.src[0].arg)
 def _is_reduce(r:UOp) -> bool: return r.arg[1] is AxisType.REDUCE
+
+def _depends_on(u:UOp, target:UOp) -> bool:
+  # does `target` appear anywhere in u's source DAG? (used to order nested reduces inner-first)
+  seen, stack = set(), [u]
+  while stack:
+    x = stack.pop()
+    if x in seen: continue
+    seen.add(x)
+    for s in x.src:
+      if s is target: return True
+      stack.append(s)
+  return False
+
+def _has_range(u:UOp, seen:set|None=None) -> bool:
+  # does the expression contain a RANGE (loop coordinate)? a constfill has none.
+  seen = set() if seen is None else seen
+  if u in seen: return False
+  seen.add(u)
+  return u.op is Ops.RANGE or any(_has_range(s, seen) for s in u.src)
 
 # ALU ops that can appear inside a data-dependent (gather) index expression
 ALU_SER = {Ops.ADD:"ADD", Ops.MUL:"MUL", Ops.SUB:"SUB", Ops.MAX:"MAX", Ops.CMPLT:"CMPLT",
@@ -174,11 +198,46 @@ class NKIRenderer(Renderer):
     return (f"# TRAINIUM_META {json.dumps(meta)}\nimport nki\nimport nki.language as nl\nimport nki.isa as nisa\n\n"
             f"@nki.jit\ndef kernel({sig}):\n" + "\n".join(lines) + "\n")
 
+  # ---- graph parsing (render() dispatches on the parsed shape) ----
+  def _dump(self, uops:list[UOp]):
+    idx = {u:i for i,u in enumerate(uops)}
+    print("\n".join(f"{i:3} {str(u.op):16} {str(u.dtype):16} src={[idx.get(s,'?') for s in u.src]} arg={u.arg!r}"
+                     for i,u in enumerate(uops)))
+
+  @staticmethod
+  def _ordered_reduces(reduces:list[UOp]) -> list[UOp]:
+    # topological order: a reduce whose body contains another reduce is emitted LATER (inner reduces first).
+    ordered, rem = [], list(reduces)
+    while rem:
+      nxt = next((rd for rd in rem if not any(_depends_on(rd.src[0], o) for o in rem if o is not rd)), rem[0])
+      ordered.append(nxt); rem.remove(nxt)
+    return ordered
+
+  @staticmethod
+  def _input_indices(uops:list[UOp], out_index:UOp, out_slot:int) -> list[UOp]:
+    # Each distinct input INDEX node is its own tile -- so the same buffer read with two access patterns
+    # (e.g. a @ a.T) becomes two tiles. The runtime passes a strided view per INDEX (as_strided reads
+    # contiguous / transpose / slice / broadcast uniformly). May be empty: a coord-only kernel (arange).
+    in_index:list[UOp] = []
+    for u in uops:
+      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg.slot != out_slot and u is not out_index and u not in in_index:
+        in_index.append(u)
+    return in_index
+
+  def _render_constfill(self, store, out_slot, out_dtype, in_index, reduces) -> str|None:
+    # pure-constant store (no input, no reduce, no coord): e.g. Tensor.full/zeros/ones (gpt2 mask,
+    # KV cache). Const-fold in the runtime -- fill the output buffer directly, no kernel / device needed.
+    if in_index or reduces or _has_range(store.src[1]): return None
+    def _ceval(u):
+      if u.op is Ops.CONST: return u.arg
+      if u.op is Ops.CAST: return _ceval(u.src[0])
+      raise NotImplementedError(f"NKI constfill: {u.op}")
+    meta = {"kind":"constfill", "out_slot":out_slot, "out_dtype":out_dtype, "value":float(_ceval(store.src[1]))}
+    return f"# TRAINIUM_META {json.dumps(meta)}\n# constfill (filled in the runtime; no kernel)\n"
+
   def render(self, uops:list[UOp]) -> str:
-    if os.getenv("NKI_DUMP"):
-      idx = {u:i for i,u in enumerate(uops)}
-      print("\n".join(f"{i:3} {str(u.op):16} {str(u.dtype):16} src={[idx.get(s,'?') for s in u.src]} arg={u.arg!r}"
-                       for i,u in enumerate(uops)))
+    if os.getenv("NKI_DUMP"): self._dump(uops)
+    # --- parse the graph: one output STORE, its slot/dtype, the reduces (ordered), the input tiles ---
     params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg.slot)
     stores = [u for u in uops if u.op is Ops.STORE]
     if len(stores) != 1: raise NotImplementedError(f"NKI renderer: expected 1 store, got {len(stores)}")
@@ -189,50 +248,16 @@ class NKIRenderer(Renderer):
     reduces = [u for u in uops if u.op is Ops.REDUCE]
     for rd in reduces:
       if rd.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rd.arg[0]}")
-    # topological order: a reduce whose body contains another reduce is emitted later
-    def _has(u, target):
-      seen, stack = set(), [u]
-      while stack:
-        x = stack.pop()
-        if x in seen: continue
-        seen.add(x)
-        for s in x.src:
-          if s is target: return True
-          stack.append(s)
-      return False
-    ordered, rem = [], list(reduces)
-    while rem:
-      nxt = next((rd for rd in rem if not any(_has(rd.src[0], o) for o in rem if o is not rd)), rem[0])
-      ordered.append(nxt); rem.remove(nxt)
+    ordered = self._ordered_reduces(reduces)
+    in_index = self._input_indices(uops, out_index, out_slot)
 
-    # Each distinct input INDEX node is its own tile -- so the same buffer read with two access
-    # patterns (e.g. a @ a.T) becomes two tiles. We pass a strided view per INDEX (the runtime
-    # as_strided reads contiguous / transpose / slice / broadcast uniformly).
-    in_index = []
-    for u in uops:
-      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg.slot != out_slot and u is not out_index and u not in in_index:
-        in_index.append(u)
-    tid = {u:i for i,u in enumerate(in_index)}   # may be empty: a coord-only kernel (e.g. arange)
-
-    # pure-constant store (no input, no reduce, no coord): e.g. Tensor.full/zeros/ones (gpt2 mask,
-    # KV cache). Const-fold in the runtime -- fill the output buffer directly, no kernel / device needed.
-    def _has_range(u, seen):
-      if u in seen: return False
-      seen.add(u)
-      return u.op is Ops.RANGE or any(_has_range(s, seen) for s in u.src)
-    if not in_index and not reduces and not _has_range(store.src[1], set()):
-      def _ceval(u):
-        if u.op is Ops.CONST: return u.arg
-        if u.op is Ops.CAST: return _ceval(u.src[0])
-        raise NotImplementedError(f"NKI constfill: {u.op}")
-      meta = {"kind":"constfill", "out_slot":out_slot, "out_dtype":out_dtype, "value":float(_ceval(store.src[1]))}
-      return f"# TRAINIUM_META {json.dumps(meta)}\n# constfill (filled in the runtime; no kernel)\n"
-
+    # --- dispatch on kernel SHAPE: constfill, matmul fast path, or the generic iteration-space kernel ---
+    if (cf := self._render_constfill(store, out_slot, out_dtype, in_index, reduces)) is not None: return cf
     kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
-    # matmul fast path: a sum-reduce of a product of two inputs -> nl.matmul (real tile matmul,
-    # not the O(M*N*K) broadcast-materialize). Within NKI limits only; else fall through to generic.
     if (mm := self._match_matmul(store, ordered, kept_ranges, out_slot, out_dtype, in_index)) is not None: return mm
+    return self._render_generic(store, out_index, out_slot, out_dtype, in_index, ordered, kept_ranges)
 
+  def _render_generic(self, store, out_index, out_slot, out_dtype, in_index, ordered, kept_ranges) -> str:
     # Unified iteration space: kept axes (LOOP, in OUTPUT order) + the reduced axis (if any).
     # partition|free split at `split` (runtime tiles partition <=128); reduce -> nl.sum/max over free.
     # A multi-range reduce (contraction over >1 axis) in the generic path would silently drop axes; the
@@ -241,6 +266,7 @@ class NKIRenderer(Renderer):
     canonical = kept_ranges + [rd.src[1] for rd in ordered]   # partition=kept; each reduce gets a free axis
     split = len(kept_ranges) if ordered else max(0, len(kept_ranges) - 1)
     csize = [_rsize(r) for r in canonical]
+    tid = {u:i for i,u in enumerate(in_index)}   # input INDEX -> tile var index (may be empty: coord-only)
     inputs_meta = []
     for u in in_index:
       base = {"param_slot":u.src[0].arg.slot, "dtype":self._npname(u.src[0].dtype)}

@@ -1,9 +1,14 @@
-# Trainium backend. Two execution paths behind DEV=TRAINIUM, sharing the NKIRenderer:
-#   - default: NKI CPU simulator (no hardware)   -- nki.simulate(kernel)(*args)
-#   - TRAINIUM_HW=1: real NeuronCore (Phase 1b). By default uses a PERSISTENT EXECUTABLE: compile each
-#     kernel+signature to a NEFF once, load it onto the device once, then launch many (warm launch is
-#     ~0.2ms vs ~1.2s for the high-level kernel(*args) path, which reloads the NEFF every call).
-#     TRAINIUM_SIMPLE_LAUNCH=1 forces the simpler high-level path (more stable, much slower).
+# Trainium backend. One device (DEV=TRAINIUM) renders NKI via NKIRenderer, then executes it through one
+# of two pluggable backends chosen once at construction (NOT a separate device -- the rendered source is
+# identical, only the execution call differs):
+#   - SIM  (default):       nki.simulate(kernel)(*args)        -- CPU simulator, no hardware
+#   - HW   (TRAINIUM_HW=1):  a PERSISTENT EXECUTABLE -- compile each kernel+signature to a NEFF once, load
+#     it onto the NeuronCore once, then launch many (warm launch ~0.2ms vs ~1.2s for the high-level
+#     kernel(*args) path, which reloads the NEFF every call). TRAINIUM_SIMPLE_LAUNCH=1 forces that simpler
+#     (more stable, much slower) high-level path.
+#
+# TrainiumProgram.__call__ dispatches on the kernel KIND (set by the renderer's meta): constfill / matmul /
+# generic (elementwise+reduce+gather). _run() delegates to the bound sim-or-hw executor.
 # See scratch/ml/theory/tinygrad-notes/backend_design.md
 import json, os, tempfile, shutil, hashlib
 import numpy as np
@@ -82,34 +87,62 @@ class TrainiumProgram:
     if os.getenv("NKI_SRC"): print(self.src)
     # a constfill is folded in the runtime (no device kernel), so don't build one
     self.kernel = None if self.meta.get("kind") == "constfill" else self._build_kernel(name, self.src)
+    self._execute = self._run_hw if _HW else self._run_sim   # the pluggable execution backend
 
+  # ---- kernel build (the rendered NKI source -> a callable) ----
   @staticmethod
   def _build_kernel(name:str, src:str):
-    h = hashlib.sha256(src.encode()).hexdigest()[:16]
     # Cache the kernel CALLABLE by source hash. nki.jit's NEFF compile-cache lives ON the function
     # object (func._nki_compile_cache), so a stable func per unique source lets every realization
     # of an identical kernel -- across Program rebuilds and the >128-row tiling loop -- reuse the
     # same compiled NEFF instead of re-running neuron-cc (~11s each). Keyed by source, not (name,
     # shapes): the source already encodes the kernel, and nki keys its own cache by arg shapes.
+    h = hashlib.sha256(src.encode()).hexdigest()[:16]
     if (cached := _KERNEL_CACHE.get(h)) is not None: return cached
-    # The sim just needs the callable, so exec'ing the source is enough. The HW compiler frontend,
-    # however, looks the entry function up by source location (AST/linecache), so an exec'd kernel
-    # fails with "entry function not found" -- it must live in a real importable .py file.
-    if not _HW:
-      ns:dict = {}
-      exec(compile(src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
-      kernel = ns["kernel"]
-    else:
-      import importlib.util
-      d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
-      path = os.path.join(d, f"k_{h}.py")
-      if not os.path.exists(path):
-        with open(path, "w") as f: f.write(src)
-      spec = importlib.util.spec_from_file_location(f"tinygrad_nki_k_{h}", path)
-      mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-      kernel = mod.kernel
+    kernel = TrainiumProgram._kernel_from_file(h, src) if _HW else TrainiumProgram._kernel_from_exec(name, src)
     _KERNEL_CACHE[h] = kernel
     return kernel
+
+  @staticmethod
+  def _kernel_from_exec(name:str, src:str):
+    # SIM: just exec the source to get the callable (the simulator doesn't care where it's defined).
+    ns:dict = {}
+    exec(compile(src, f"<nki:{name}>", "exec"), ns)   # defines `kernel`
+    return ns["kernel"]
+
+  @staticmethod
+  def _kernel_from_file(h:str, src:str):
+    # HW: the compiler frontend looks the entry function up by source LOCATION (AST/linecache), so an
+    # exec'd kernel fails with "entry function not found" -- it must live in a real importable .py file.
+    import importlib.util
+    d = os.path.join(tempfile.gettempdir(), "tinygrad_nki"); os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"k_{h}.py")
+    if not os.path.exists(path):
+      with open(path, "w") as f: f.write(src)
+    spec = importlib.util.spec_from_file_location(f"tinygrad_nki_k_{h}", path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod.kernel
+
+  # ---- execution backends (bound to self._execute at construction) ----
+  def _run(self, *np_args, srcs=None):
+    # numpy in -> numpy out. `srcs` is a per-arg list (or None) of (TrainiumBuffer, view-signature) for
+    # on-core weight residency [Goal 3]; None entries (synthetic/sliced args) are always re-DMA'd, and the
+    # sim / high-level core-0 paths ignore it entirely.
+    return self._execute(np_args, srcs)
+
+  def _run_sim(self, np_args, srcs):
+    # CPU simulator: no hardware. residency hints (`srcs`) are HW-only, so ignored here.
+    import nki
+    return np.asarray(nki.simulate(self.kernel)(*np_args))
+
+  def _run_hw(self, np_args, srcs):
+    # real NeuronCore. Default: the persistent executable (load the NEFF once, launch many).
+    if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
+    compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
+    if _NO_RESIDENT and self.core_id == 0:                         # legacy path: well-tested high-level run, no residency
+      res = compiled.run(**dict(zip(names, np_args)))
+      return np.asarray(next(iter(res.outputs.values())))
+    return self._run_on_core(compiled, names, np_args, None if _NO_RESIDENT else srcs)
 
   def _compiled_for(self, np_args):
     # Build (once) and cache a CompiledKernel specialized to these args' shapes/dtypes. The loaded NEFF
@@ -146,21 +179,6 @@ class TrainiumProgram:
     _COMPILED_CACHE[key] = (hit := (compiled, list(inputs.keys())))
     return hit
 
-  def _run(self, *np_args, srcs=None):
-    # one place the two paths diverge: real device vs CPU simulator. numpy in -> numpy out either way.
-    # `srcs` is a per-arg list (or None) of (TrainiumBuffer, view-signature) used for on-core weight
-    # residency [Goal 3]; None entries (synthetic/sliced args) are always re-DMA'd. The sim and the
-    # high-level core-0 paths ignore it.
-    if not _HW:
-      import nki
-      return np.asarray(nki.simulate(self.kernel)(*np_args))
-    if _SIMPLE_LAUNCH: return np.asarray(self.kernel(*np_args))    # high-level path: reloads NEFF per call
-    compiled, names = self._compiled_for(np_args)                  # persistent executable: load once, launch many
-    if _NO_RESIDENT and self.core_id == 0:                         # legacy path: well-tested high-level run, no residency
-      res = compiled.run(**dict(zip(names, np_args)))
-      return np.asarray(next(iter(res.outputs.values())))
-    return self._run_on_core(compiled, names, np_args, None if _NO_RESIDENT else srcs)
-
   def _run_on_core(self, compiled, names, np_args, srcs=None):
     # Run a cached NEFF on a SPECIFIC NeuronCore. The high-level CompiledKernel.run() / _ensure_loaded()
     # hardcode core 0 (SpikeModel.load_from_neff(neff_path) with the default core_id=0), so for core N we
@@ -186,34 +204,48 @@ class TrainiumProgram:
     model(si, outputs=so)
     return np.asarray(next(iter(so.values())).numpy())
 
+  # ---- kernel dispatch (by KIND) ----
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
+    kind = self.meta.get("kind")
+    if kind == "constfill": return self._run_constfill(bufs)
+    if kind == "matmul":    return self._run_matmul(bufs)
+    return self._run_elementwise(bufs)    # generic: elementwise / reduce / gather / flat
+
+  def _run_constfill(self, bufs):
+    # pure-constant tensor (Tensor.full/zeros/ones, e.g. gpt2 mask / KV cache): fill in numpy, no device.
     m = self.meta
-    if m.get("kind") == "constfill":   # pure-constant tensor (Tensor.full/zeros/ones): fill in numpy, no device
-      d = np.dtype(m["out_dtype"]); n = len(bufs[m["out_slot"]]) // d.itemsize
-      bufs[m["out_slot"]].write(np.full(n, m["value"], dtype=d).tobytes())
-      return None
-    if m.get("kind") == "matmul":   # nc_matmul fast path: build A as (Bp,K,M), B as (Bp,K,N) strided views
-      batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1; Ksizes = m["Ksizes"]
-      def view(spec, shape, role):
-        # strides come from the renderer (0 on a batch axis = broadcast that operand). The contraction may
-        # span >1 axis (Ksizes), e.g. a reshape merging heads*head_dim -- materialize then flatten below.
-        d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]].host, dtype=d)
-        arr = np.ascontiguousarray(np.lib.stride_tricks.as_strided(
-          flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
-        # [Goal 3] residency source: a matmul operand is overwhelmingly a weight (read-only, stable) -> a
-        # contiguous K-major view identified by (role, offset, strides, shape) is DMA'd once and resident.
-        src = (bufs[spec["param_slot"]], (role, spec["offset"], tuple(spec["strides"]), tuple(shape)))
-        return arr, src
-      built = [view(m["A"], (*batch, *Ksizes, m["M"]), "A"), view(m["B"], (*batch, *Ksizes, m["N"]), "B")]
-      built += [view(p, (*batch, m["M"], m["N"]), f"P{i}") for i, p in enumerate(m["post"])]
-      args = [built[0][0].reshape(Bp, m["K"], m["M"]), built[1][0].reshape(Bp, m["K"], m["N"])]
-      args += [b[0].reshape(Bp, m["M"], m["N"]) for b in built[2:]]   # -> (Bp,M,N)
-      out = self._run(*args, srcs=[b[1] for b in built])           # kernel returns (Bp, M, N)
-      bufs[m["out_slot"]].write(np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes())
-      return None
-    # Build each input INDEX as a strided view over the canonical iteration space: full size on
-    # PARTITION (kept) axes, natural size on FREE axes (1 where stride is 0). A 0 stride broadcasts,
-    # a nonzero stride + offset reads contiguous/transpose/slice -- all uniformly. Then reshape (P, F).
+    d = np.dtype(m["out_dtype"]); n = len(bufs[m["out_slot"]]) // d.itemsize
+    bufs[m["out_slot"]].write(np.full(n, m["value"], dtype=d).tobytes())
+    return None
+
+  def _run_matmul(self, bufs):
+    # nc_matmul fast path: build A as (Bp,K,M), B as (Bp,K,N) strided views; the kernel returns (Bp,M,N).
+    m = self.meta
+    batch = m["batch"]; Bp = int(np.prod(batch)) if batch else 1; Ksizes = m["Ksizes"]
+    def view(spec, shape, role):
+      # strides come from the renderer (0 on a batch axis = broadcast that operand). The contraction may
+      # span >1 axis (Ksizes), e.g. a reshape merging heads*head_dim -- materialize then flatten below.
+      d = np.dtype(spec["dtype"]); flat = np.frombuffer(bufs[spec["param_slot"]].host, dtype=d)
+      arr = np.ascontiguousarray(np.lib.stride_tricks.as_strided(
+        flat[spec["offset"]:], shape=shape, strides=[s*d.itemsize for s in spec["strides"]]))
+      # [Goal 3] residency source: a matmul operand is overwhelmingly a weight (read-only, stable) -> a
+      # contiguous K-major view identified by (role, offset, strides, shape) is DMA'd once and resident.
+      src = (bufs[spec["param_slot"]], (role, spec["offset"], tuple(spec["strides"]), tuple(shape)))
+      return arr, src
+    built = [view(m["A"], (*batch, *Ksizes, m["M"]), "A"), view(m["B"], (*batch, *Ksizes, m["N"]), "B")]
+    built += [view(p, (*batch, m["M"], m["N"]), f"P{i}") for i, p in enumerate(m["post"])]
+    args = [built[0][0].reshape(Bp, m["K"], m["M"]), built[1][0].reshape(Bp, m["K"], m["N"])]
+    args += [b[0].reshape(Bp, m["M"], m["N"]) for b in built[2:]]   # -> (Bp,M,N)
+    out = self._run(*args, srcs=[b[1] for b in built])           # kernel returns (Bp, M, N)
+    bufs[m["out_slot"]].write(np.ascontiguousarray(out, dtype=np.dtype(m["out_dtype"])).tobytes())
+    return None
+
+  def _run_elementwise(self, bufs):
+    # generic iteration-space kernel (elementwise / reduce / gather). Build each input INDEX as a strided
+    # view over the canonical iteration space: full size on PARTITION (kept) axes, natural size on FREE
+    # axes (1 where stride is 0). A 0 stride broadcasts, a nonzero stride + offset reads contiguous/
+    # transpose/slice -- all uniformly. Then reshape (P, F), tile partition <=128, and write back.
+    m = self.meta
     cs, split, nd = m["canonical_sizes"], m["split"], len(m["canonical_sizes"])
     P = int(np.prod(cs[:split])) if split else 1
     in_arrs = []; srcs = []   # srcs[i] = (buffer, view-sig) for residency, or None (synthetic/non-affine)
