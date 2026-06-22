@@ -142,6 +142,22 @@ def _ser_index(u:UOp, canonical:list, npname) -> dict:
   if u.op in ALU_SER: return {"t":"alu", "op":ALU_SER[u.op], "s":[_ser_index(x, canonical, npname) for x in u.src]}
   raise NotImplementedError(f"NKI gather index: unhandled {u.op}")
 
+# scalar (rangeless) arithmetic the runtime can evaluate without a device kernel: the optimizer's bookkeeping
+# -- step counter t=t+1, Adam moment/bias scalars m*=b1, lr*sqrt(1-b2**t)/(1-b1**t) -- which read scalar param
+# values (INDEX(param, const)) and combine them with constants. Includes the IN-PLACE case (value reads the
+# same scalar buffer it writes), which the generic path can't express (the read is the output index).
+SCALAR_SER = {Ops.ADD:"ADD", Ops.SUB:"SUB", Ops.MUL:"MUL", Ops.FDIV:"FDIV", Ops.CDIV:"FDIV", Ops.MAX:"MAX",
+              Ops.NEG:"NEG", Ops.RECIPROCAL:"RECIP", Ops.SQRT:"SQRT", Ops.POW:"POW", Ops.EXP2:"EXP2", Ops.LOG2:"LOG2"}
+def _ser_scalar(u:UOp, npname) -> dict:
+  if u.op is Ops.CONST: return {"t":"c", "v":float(u.arg)}
+  if u.op is Ops.CAST: return _ser_scalar(u.src[0], npname)   # compute in float; out dtype applied on write
+  if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM:
+    c, o = _affine(u.src[1])
+    if c: raise NotImplementedError("NKI scalar: non-constant param index")   # must be a fixed scalar slot
+    return {"t":"ld", "slot":u.src[0].arg.slot, "dtype":npname(u.src[0].dtype), "idx":o}
+  if u.op in SCALAR_SER: return {"t":"op", "op":SCALAR_SER[u.op], "s":[_ser_scalar(x, npname) for x in u.src]}
+  raise NotImplementedError(f"NKI scalar: unhandled {u.op}")
+
 class NKIRenderer(Renderer):
   suffix = "NKI"
   has_local = False
@@ -334,12 +350,39 @@ class NKIRenderer(Renderer):
     # pure-constant store (no input, no reduce, no coord): e.g. Tensor.full/zeros/ones (gpt2 mask,
     # KV cache). Const-fold in the runtime -- fill the output buffer directly, no kernel / device needed.
     if in_index or reduces or _has_range(store.src[1]): return None
+    # fold a pure-constant SCALAR expression to one number. Beyond plain const/cast: the optimizer emits scalar
+    # arithmetic with no tensor input -- Adam's bias correction lr*sqrt(1-b2**t)/(1-b1**t), the step counter,
+    # etc. -- which lands here (no input/reduce/range) and must be evaluated, not just read off a leaf CONST.
     def _ceval(u):
       if u.op is Ops.CONST: return u.arg
       if u.op is Ops.CAST: return _ceval(u.src[0])
+      s = [_ceval(x) for x in u.src]
+      if u.op is Ops.ADD: return s[0] + s[1]
+      if u.op is Ops.SUB: return s[0] - s[1]
+      if u.op is Ops.MUL: return s[0] * s[1]
+      if u.op in (Ops.FDIV, Ops.CDIV): return s[0] / s[1]
+      if u.op is Ops.NEG: return -s[0]
+      if u.op is Ops.RECIPROCAL: return 1.0 / s[0]
+      if u.op is Ops.SQRT: return math.sqrt(s[0])
+      if u.op is Ops.MAX: return max(s[0], s[1])
+      if u.op is Ops.POW: return s[0] ** s[1]
+      if u.op is Ops.EXP2: return 2.0 ** s[0]
+      if u.op is Ops.LOG2: return math.log2(s[0])
       raise NotImplementedError(f"NKI constfill: {u.op}")
     meta = {"kind":"constfill", "out_slot":out_slot, "out_dtype":out_dtype, "value":float(_ceval(store.src[1]))}
     return f"# TRAINIUM_META {json.dumps(meta)}\n# constfill (filled in the runtime; no kernel)\n"
+
+  def _render_scalar(self, store, out_index, out_slot, out_dtype, reduces) -> str|None:
+    # a single-element store (the output INDEX has no RANGEs) whose value is scalar arithmetic over constants
+    # and scalar param reads -- the optimizer's bookkeeping. Evaluate in the runtime; no device kernel. Handles
+    # the IN-PLACE read-modify-write (t = t*0.9) the generic path can't express (the read IS the output index).
+    if reduces: return None
+    oc, oo = _affine(out_index.src[1])
+    if oc: return None                         # the output spans ranges -> not a scalar store
+    try: expr = _ser_scalar(store.src[1], self._npname)
+    except NotImplementedError: return None
+    meta = {"kind":"scalar", "out_slot":out_slot, "out_dtype":out_dtype, "out_idx":oo, "expr":expr}
+    return f"# TRAINIUM_META {json.dumps(meta)}\n# scalar (eval in runtime; no kernel)\n"
 
   def render(self, uops:list[UOp]) -> str:
     if os.getenv("NKI_DUMP"): self._dump(uops)
@@ -360,8 +403,13 @@ class NKIRenderer(Renderer):
       if rd.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rd.arg[0]}")
     ordered = self._ordered_reduces(reduces)
     in_index = self._input_indices(uops, out_index, out_slot)
+    # in-place read-modify-write (e.g. an optimizer's m = b1*m + (1-b1)*g): the value reads the SAME buffer it
+    # writes, so its read is the output INDEX -- normally excluded from inputs. Add it back as an input tile;
+    # the runtime materializes every input (a numpy copy) before writeback, so reading-then-writing is safe.
+    if _depends_on(store.src[1], out_index) and out_index not in in_index: in_index.append(out_index)
 
-    # --- dispatch on kernel SHAPE: constfill, matmul fast path, or the generic iteration-space kernel ---
+    # --- dispatch on kernel SHAPE: scalar, constfill, matmul fast path, or the generic iteration-space kernel ---
+    if (sc := self._render_scalar(store, out_index, out_slot, out_dtype, reduces)) is not None: return sc
     if (cf := self._render_constfill(store, out_slot, out_dtype, in_index, reduces)) is not None: return cf
     kept_ranges = [r for r,_ in sorted(_affine(out_index.src[1])[0].items(), key=lambda kv: -kv[1])]
     if (mm := self._match_matmul(store, ordered, kept_ranges, out_slot, out_dtype, in_index)) is not None: return mm
@@ -392,7 +440,12 @@ class NKIRenderer(Renderer):
       except NotImplementedError:            # data-dependent index (gather) -> serialize for runtime eval
         inputs_meta.append({**base, "kind":"gather", "index":_ser_index(u.src[1], canonical, self._npname)})
 
-    ref = "t0" if in_index else "c0"   # coord-only kernels (arange) reference the first coord tile
+    # `ref` supplies the OUTPUT free shape (and WHERE-fill shapes). It must be a FULL-free input -- one that
+    # spans the free axes, not a broadcast scalar (all-zero free strides, e.g. an optimizer's bias-correction
+    # scalar). With a scalar first input, `out = ndarray(t0.shape)` would be (P,1) and the (P,F) value wouldn't
+    # broadcast. A gather spans the full grid, so it always qualifies. Falls back to t0 (then the coord tile).
+    def _full_free(im): return im["kind"] != "strided" or any(im["strides"][c] != 0 for c in range(split, len(csize)))
+    ref = f"t{next((i for i,im in enumerate(inputs_meta) if _full_free(im)), 0)}" if in_index else "c0"
     reduce_vars:dict = {}
     coords:dict = {}            # RANGE used as a value -> coordinate tile var (arange / iota / triangular masks)
     def leaf(u):

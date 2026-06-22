@@ -57,6 +57,19 @@ def _eval_index(node, shape, bufs):
   if t == "alu": return _ALU[node["op"]](*[_eval_index(x, shape, bufs) for x in node["s"]])
   raise NotImplementedError(f"NKI gather eval: {t}")
 
+import math
+_SCALAR_OP = {"ADD":lambda s:s[0]+s[1], "SUB":lambda s:s[0]-s[1], "MUL":lambda s:s[0]*s[1],
+              "FDIV":lambda s:s[0]/s[1], "MAX":lambda s:max(s[0],s[1]), "NEG":lambda s:-s[0],
+              "RECIP":lambda s:1.0/s[0], "SQRT":lambda s:math.sqrt(s[0]), "POW":lambda s:s[0]**s[1],
+              "EXP2":lambda s:2.0**s[0], "LOG2":lambda s:math.log2(s[0])}
+def _eval_scalar(node, bufs):
+  # evaluate a serialized scalar (rangeless) expression -> one python float (optimizer bookkeeping)
+  t = node["t"]
+  if t == "c": return node["v"]
+  if t == "ld": return float(np.frombuffer(bufs[node["slot"]].host, dtype=np.dtype(node["dtype"]))[node["idx"]])
+  if t == "op": return _SCALAR_OP[node["op"]]([_eval_scalar(x, bufs) for x in node["s"]])
+  raise NotImplementedError(f"NKI scalar eval: {t}")
+
 class TrainiumCompiler(Compiler):
   # SIM path: pass the rendered NKI source through as bytes. (HW path later: neuron-cc -> NEFF.)
   def compile(self, src:str) -> bytes: return src.encode()
@@ -103,8 +116,8 @@ class TrainiumProgram:
     self.meta = json.loads(self.src.splitlines()[0].split("TRAINIUM_META", 1)[1])
     self._srchash = hashlib.sha256(self.src.encode()).hexdigest()[:16]
     if os.getenv("NKI_SRC"): print(self.src)
-    # a constfill is folded in the runtime (no device kernel), so don't build one
-    self.kernel = None if self.meta.get("kind") == "constfill" else self._build_kernel(name, self.src)
+    # constfill / scalar are folded in the runtime (no device kernel), so don't build one
+    self.kernel = None if self.meta.get("kind") in ("constfill", "scalar") else self._build_kernel(name, self.src)
     self._execute = self._run_hw if _HW else self._run_sim   # the pluggable execution backend
 
   # ---- kernel build (the rendered NKI source -> a callable) ----
@@ -225,6 +238,7 @@ class TrainiumProgram:
   def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     kind = self.meta.get("kind")
     if kind == "constfill": return self._run_constfill(bufs)
+    if kind == "scalar":    return self._run_scalar(bufs)
     if kind == "matmul":    return self._run_matmul(bufs)
     return self._run_elementwise(bufs)    # generic: elementwise / reduce / gather / flat
 
@@ -233,6 +247,17 @@ class TrainiumProgram:
     m = self.meta
     d = np.dtype(m["out_dtype"]); n = len(bufs[m["out_slot"]]) // d.itemsize
     bufs[m["out_slot"]].write(np.full(n, m["value"], dtype=d).tobytes())
+    return None
+
+  def _run_scalar(self, bufs):
+    # single-element store of a scalar arithmetic expression (the optimizer's step counter / Adam moment &
+    # bias-correction scalars). Evaluate in numpy -- reading scalar param values, incl. the in-place case where
+    # the value reads the same buffer it writes -- and write the one element back. No device kernel.
+    m = self.meta; d = np.dtype(m["out_dtype"])
+    val = _eval_scalar(m["expr"], bufs)
+    out = np.frombuffer(bufs[m["out_slot"]].host, dtype=d).copy()
+    out[m["out_idx"]] = val
+    bufs[m["out_slot"]].write(out.tobytes())
     return None
 
   def _run_matmul(self, bufs):
