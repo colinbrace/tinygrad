@@ -74,6 +74,63 @@ def _has_range(u:UOp, seen:set|None=None) -> bool:
   seen.add(u)
   return u.op is Ops.RANGE or any(_has_range(s, seen) for s in u.src)
 
+def _has_any_range(u:UOp, rset:set, seen:set|None=None) -> bool:
+  # does the expression contain any RANGE from rset?
+  seen = set() if seen is None else seen
+  if u in seen: return False
+  seen.add(u)
+  if u.op is Ops.RANGE and u in rset: return True
+  return any(_has_any_range(s, rset, seen) for s in u.src)
+
+def _ref_count(root:UOp, target:UOp) -> int:
+  # number of src-edges in root's DAG that point at target (==1 -> target is used exactly once = linear)
+  seen, stack, n = set(), [root], 0
+  while stack:
+    x = stack.pop()
+    if x in seen: continue
+    seen.add(x)
+    n += sum(1 for s in x.src if s is target)
+    stack.extend(x.src)
+  return n
+
+# ops a reduce ADD distributes through: sum_A(f) pulls into the operands (coefficients must be A-invariant,
+# checked separately). WHERE distributes only when its non-target branch is the additive identity 0.
+_DISTRIB = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.MULACC, Ops.CAST, Ops.NEG}
+def _sum_distributive_path(u:UOp, target:UOp) -> bool:
+  # every op on the (unique) path from u down to target is sum-distributive, so sum_A commutes inward.
+  if u is target: return True
+  child = next((s for s in u.src if s is target or _depends_on(s, target)), None)
+  if child is None: return False
+  if u.op in _DISTRIB: return _sum_distributive_path(child, target)
+  if u.op is Ops.WHERE and child is u.src[1] and u.src[2].op is Ops.CONST and float(u.src[2].arg) == 0.0:
+    return _sum_distributive_path(child, target)   # WHERE(cond, target_path, 0): sum_A(c?x:0) = c?sum_A(x):0
+  return False
+
+def _merge_nested_reduces(store:UOp, reduces:list[UOp]) -> tuple[UOp, list[UOp]]:
+  # Collapse a nested pair of ADD-reduces into one multi-range reduce when it is algebraically exact:
+  #   sum_B( g( sum_A(I) ) )  ==  sum_{A,B}( g'(I) )  when g is LINEAR in the inner sum with coefficients
+  # invariant over A. This is the conv INPUT-gradient shape: sum_{oh,ow}( mask * sum_cout(grad*w) ), where
+  # the boundary mask depends only on the outer (oh,ow) axes, not the inner (cout) axis. Merging it lets the
+  # proven single-reduce path render it (same as conv FORWARD), instead of needing >2D multi-axis tiles.
+  # Guard hard: both ADD, inner used exactly once (linear), every path op sum-distributive, and the inner
+  # reduce's ranges appear in the outer body ONLY inside the inner reduce (-> A-invariant coefficients).
+  changed = True
+  while changed:
+    changed = False
+    for outer in [r for r in reduces if r.arg[0] is Ops.ADD]:
+      inner = next((r for r in reduces if r is not outer and r.arg[0] is Ops.ADD and _ref_count(outer.src[0], r) == 1
+                    and _sum_distributive_path(outer.src[0], r)), None)
+      if inner is None: continue
+      A = set(inner.src[1:])
+      body_no_inner = outer.src[0].substitute({inner: inner.src[0].const_like(0)})
+      if _has_any_range(body_no_inner, A): continue          # an A-range escapes the inner reduce -> not invariant
+      merged = outer.replace(src=(outer.src[0].substitute({inner: inner.src[0]}), *outer.src[1:], *inner.src[1:]))
+      store = store.substitute({outer: merged})
+      reduces = [merged if r is outer else r for r in reduces if r is not inner]
+      changed = True
+      break
+  return store, reduces
+
 # ALU ops that can appear inside a data-dependent (gather) index expression
 ALU_SER = {Ops.ADD:"ADD", Ops.MUL:"MUL", Ops.SUB:"SUB", Ops.MAX:"MAX", Ops.CMPLT:"CMPLT",
            Ops.CMPNE:"CMPNE", Ops.CMPEQ:"CMPEQ", Ops.AND:"AND", Ops.OR:"OR", Ops.XOR:"XOR",
@@ -139,7 +196,9 @@ class NKIRenderer(Renderer):
       # so the softmax hot path keeps its exact op count. (maxpool/conv input-grad need this; see Phase 2.)
       wd = f"nl.{self._npname(u.dtype)}"
       nonconst = u.src[2] if u.src[1].op is Ops.CONST else u.src[1]
-      sref = r(nonconst) if nonconst.op is not Ops.CONST else f"{ref}"   # both-const: fall back to ref
+      # both branches const (e.g. a relu mask: cond ? 1.0 : 0.0) -> the result shape IS the CONDITION's shape
+      # (which may be a reduced (P,1), not the full (P,F) of the first input tile), so fill against the cond.
+      sref = r(nonconst) if nonconst.op is not Ops.CONST else r(u.src[0])
       def tile(s):
         if s.op is Ops.CONST: return f"nl.full(({sref}).shape, {r(s)}, dtype={wd})"
         e = r(s)
@@ -290,6 +349,10 @@ class NKIRenderer(Renderer):
     out_slot = out_index.src[0].arg.slot
     out_dtype = self._npname(next(p for p in params if p.arg.slot == out_slot).dtype)
     reduces = [u for u in uops if u.op is Ops.REDUCE]
+    # collapse algebraically-mergeable nested ADD-reduces into one multi-range reduce (conv input-gradient:
+    # sum_oh,ow(mask * sum_cout(grad*w)) -> sum_cout,oh,ow(mask*grad*w)). Lets the proven single-reduce path
+    # render it without >2D multi-axis tiles. No-op for everything else (attention's two reduces aren't nested).
+    store, reduces = _merge_nested_reduces(store, reduces)
     for rd in reduces:
       if rd.arg[0] not in NL_REDUCE: raise NotImplementedError(f"NKI: reduce op {rd.arg[0]}")
     ordered = self._ordered_reduces(reduces)
