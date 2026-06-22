@@ -23,6 +23,16 @@ NL_UNOP  = {Ops.NEG:"nl.negative", Ops.SQRT:"nl.sqrt", Ops.RECIPROCAL:"nl.recipr
 NL_REDUCE = {Ops.ADD:"nl.sum", Ops.MAX:"nl.max", Ops.MUL:"nl.prod"}
 NL_BOOL = {Ops.AND:"and", Ops.OR:"or", Ops.XOR:"xor"}   # logical_* for bool, bitwise_* for int (see _emit)
 LN2 = 0.6931471805599453
+NL_BIG = 3.0e38   # < fp32 max (3.4e38); clamps inf in a WHERE branch so the arithmetic select can't poison (0*inf=nan)
+
+def _has_div(u:UOp, seen:set|None=None) -> bool:
+  # does the expression contain a division? reciprocal(0)/x/0 -> +-inf, which poisons nl.where's
+  # arithmetic select (0*inf = nan). Used to decide whether a WHERE branch needs clamping (see _emit).
+  seen = set() if seen is None else seen
+  if u in seen: return False
+  seen.add(u)
+  if u.op in (Ops.RECIPROCAL, Ops.FDIV, Ops.CDIV): return True
+  return any(_has_div(s, seen) for s in u.src)
 
 def _affine(u:UOp) -> tuple[dict, int]:
   # parse an integer index expr into ({RANGE uop: stride}, constant offset). strides index the FLAT
@@ -120,16 +130,36 @@ class NKIRenderer(Renderer):
       # a CONST branch -> a full tile matching the WHERE's RESULT dtype and the NON-CONST branch's SHAPE.
       # (Using ref is unreliable: ref/t0 may be the bool mask -> wrong dtype, or a reduced (P,1) tile -> the
       # fill wouldn't broadcast against the (P,F) data. The non-const branch carries the real (P,F) shape.)
+      # nl.where is an ARITHMETIC select (cond*x + (1-cond)*y), not a lazy numpy.where. So a non-finite value
+      # in the UNSELECTED branch poisons the result: 0*inf = nan (and inf-inf = nan). tinygrad guards every
+      # divide-by-zero with a mask, so the inf only ever lands at masked-out positions -- but the arithmetic
+      # select still turns it into nan there. A branch that contains a division (RECIPROCAL/FDIV/CDIV) can be
+      # +-inf, so CLAMP it to a large finite range first: clamp(inf)=BIG, and 0*BIG = 0, matching CPU's lazy
+      # where. Branches with no division (e.g. attention scores, masked with a finite -1e9) are left untouched,
+      # so the softmax hot path keeps its exact op count. (maxpool/conv input-grad need this; see Phase 2.)
       wd = f"nl.{self._npname(u.dtype)}"
       nonconst = u.src[2] if u.src[1].op is Ops.CONST else u.src[1]
       sref = r(nonconst) if nonconst.op is not Ops.CONST else f"{ref}"   # both-const: fall back to ref
-      tile = lambda s: f"nl.full(({sref}).shape, {r(s)}, dtype={wd})" if s.op is Ops.CONST else r(s)
+      def tile(s):
+        if s.op is Ops.CONST: return f"nl.full(({sref}).shape, {r(s)}, dtype={wd})"
+        e = r(s)
+        return f"nl.minimum(nl.maximum({e}, {-NL_BIG!r}), {NL_BIG!r})" if _has_div(s) else e
       return f"nl.where({r(u.src[0])}, {tile(u.src[1])}, {tile(u.src[2])})"
     if u.op is Ops.MULACC: return f"nl.add(nl.multiply({r(u.src[0])}, {r(u.src[1])}), {r(u.src[2])})"
     if u.op is Ops.EXP2: return f"nl.exp(nl.multiply({r(u.src[0])}, {LN2!r}))"
     if u.op is Ops.LOG2: return f"nl.multiply(nl.log({r(u.src[0])}), {1.0/LN2!r})"
-    if u.op is Ops.FLOORMOD: return f"nl.mod({r(u.src[0])}, {r(u.src[1])})"
-    if u.op is Ops.FLOORDIV: return f"nl.floor(nl.divide({r(u.src[0])}, {r(u.src[1])}))"
+    # FLOORDIV/FLOORMOD on coordinate tiles (window-index masks for maxpool / conv input-grad). The HW
+    # compiler rejects nl.mod AND a scalar nl.divide ("unsupported operator 'mod'/'divide'" as a fused op0),
+    # so build them from multiply/floor/subtract only. The divisor is a positive integer window size (CONST),
+    # so a/b = a * (1/b) (exact-enough for the small window strides) and FLOORMOD = a - floor(a/b)*b. Matches
+    # numpy floordiv/floormod for the non-negative coords + positive divisors these masks use.
+    def _fdiv(a, bu):   # floor(a / b) with b a CONST -> floor(a * (1/b)); falls back to nl.divide otherwise
+      if bu.op is Ops.CONST: return f"nl.floor(nl.multiply({a}, {1.0/float(bu.arg)!r}))"
+      return f"nl.floor(nl.divide({a}, {r(bu)}))"
+    if u.op is Ops.FLOORDIV: return _fdiv(r(u.src[0]), u.src[1])
+    if u.op is Ops.FLOORMOD:
+      a, b = r(u.src[0]), r(u.src[1])
+      return f"nl.subtract({a}, nl.multiply({_fdiv(a, u.src[1])}, {b}))"
     if u.op in NL_BOOL:   # boolean masks (xent one-hot) use logical_*; integer bitwise uses bitwise_*
       pre = "logical" if u.dtype == dtypes.bool else "bitwise"
       return f"nl.{pre}_{NL_BOOL[u.op]}({r(u.src[0])}, {r(u.src[1])})"
@@ -317,18 +347,16 @@ class NKIRenderer(Renderer):
       reduce_vars[rd] = f"r{i}"
     out_free = 1 if ordered else (int(np.prod(csize[split:])) if split < len(csize) else 1)
     final = self._emit(store.src[1], leaf, ref)
-    # coordinate-as-value (arange etc.): fine in an elementwise kernel, and fine inside a reduce when the
-    # coord runs over a REDUCE (free) axis -- it's just another (P,F) tile reduced over F (e.g. argmax =
-    # max over an index arange). A coord over a KEPT axis combined with a reduce is the fused-flash-
-    # attention case (coord and reduce on different axes) which the 2D tile model can't express -> raise.
-    # A coordinate over a KEPT axis combined with a reduce is a 2D mask g(kept_coord, reduce_coord) applied
-    # elementwise then reduced -- e.g. a causal-attention mask. That IS expressible and correct in the tile
-    # model (the kept-axis coord is a (P,F) tile constant over the reduce axis). BUT when the kernel also has
-    # a GATHER (data-dependent index, e.g. maxpool / conv input-gradient), the coord entangles with the
-    # gather offsets and the 2D-tile model renders it WRONG -> reject those (Phase 2 structured kernels).
-    has_gather = any(im.get("kind") == "gather" for im in inputs_meta)
-    if coords and ordered and has_gather and any(canonical.index(c) < split for c in coords):
-      raise NotImplementedError("NKI: coord over a kept axis + reduce + gather not supported (needs a structured kernel)")
+    # coordinate-as-value (arange etc.): fine in an elementwise kernel, and fine inside a reduce. A coord over
+    # a REDUCE (free) axis is just another (P,F) tile reduced over F (e.g. argmax = max over an index arange).
+    # A coord over a KEPT axis combined with a reduce is a 2D mask g(kept_coord, reduce_coord) applied
+    # elementwise then reduced -- the causal-attention mask (Phase 1) AND the maxpool / conv input-gradient
+    # backward kernels (Phase 2). It IS expressible and correct in the tile model: the kept-axis coord is a
+    # (P,F) tile constant over the reduce axis, the runtime evaluates any GATHER index over the full (P,F) grid,
+    # and the reduce sums the free axis. This was previously rejected for the gather case out of caution -- the
+    # real failure was nl.where's arithmetic select poisoning a masked reciprocal-of-zero into nan (now clamped
+    # in _emit), NOT a tile-model limit. Verified: maxpool-grad bit-exact to CPU. (conv input-grad needs the
+    # multi-range-reduce path below too.)
     if not in_index and not coords: raise NotImplementedError("NKI renderer: no input access")
     # output ndarray takes the OUTPUT param's dtype (not an input's), else stores truncate (e.g. int<-float);
     # broadcast the value up to the output shape (e.g. expand: a (P,1) value into a (P,F) output).
