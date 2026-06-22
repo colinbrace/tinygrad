@@ -23,16 +23,7 @@ NL_UNOP  = {Ops.NEG:"nl.negative", Ops.SQRT:"nl.sqrt", Ops.RECIPROCAL:"nl.recipr
 NL_REDUCE = {Ops.ADD:"nl.sum", Ops.MAX:"nl.max", Ops.MUL:"nl.prod"}
 NL_BOOL = {Ops.AND:"and", Ops.OR:"or", Ops.XOR:"xor"}   # logical_* for bool, bitwise_* for int (see _emit)
 LN2 = 0.6931471805599453
-NL_BIG = 3.0e38   # < fp32 max (3.4e38); clamps inf in a WHERE branch so the arithmetic select can't poison (0*inf=nan)
-
-def _has_div(u:UOp, seen:set|None=None) -> bool:
-  # does the expression contain a division? reciprocal(0)/x/0 -> +-inf, which poisons nl.where's
-  # arithmetic select (0*inf = nan). Used to decide whether a WHERE branch needs clamping (see _emit).
-  seen = set() if seen is None else seen
-  if u in seen: return False
-  seen.add(u)
-  if u.op in (Ops.RECIPROCAL, Ops.FDIV, Ops.CDIV): return True
-  return any(_has_div(s, seen) for s in u.src)
+NL_BIG = 3.0e38   # < fp32 max (3.4e38); clamps a division result so a later arithmetic select can't poison (0*inf=nan)
 
 def _affine(u:UOp) -> tuple[dict, int]:
   # parse an integer index expr into ({RANGE uop: stride}, constant offset). strides index the FLAT
@@ -187,22 +178,15 @@ class NKIRenderer(Renderer):
       # a CONST branch -> a full tile matching the WHERE's RESULT dtype and the NON-CONST branch's SHAPE.
       # (Using ref is unreliable: ref/t0 may be the bool mask -> wrong dtype, or a reduced (P,1) tile -> the
       # fill wouldn't broadcast against the (P,F) data. The non-const branch carries the real (P,F) shape.)
-      # nl.where is an ARITHMETIC select (cond*x + (1-cond)*y), not a lazy numpy.where. So a non-finite value
-      # in the UNSELECTED branch poisons the result: 0*inf = nan (and inf-inf = nan). tinygrad guards every
-      # divide-by-zero with a mask, so the inf only ever lands at masked-out positions -- but the arithmetic
-      # select still turns it into nan there. A branch that contains a division (RECIPROCAL/FDIV/CDIV) can be
-      # +-inf, so CLAMP it to a large finite range first: clamp(inf)=BIG, and 0*BIG = 0, matching CPU's lazy
-      # where. Branches with no division (e.g. attention scores, masked with a finite -1e9) are left untouched,
-      # so the softmax hot path keeps its exact op count. (maxpool/conv input-grad need this; see Phase 2.)
+      # nl.where is an ARITHMETIC select (cond*x + (1-cond)*y), so a +-inf in either branch poisons the result
+      # (0*inf = nan). That inf is stopped at its SOURCE -- divisions are clamped to a finite range when emitted
+      # (see RECIPROCAL/FDIV/CDIV below) -- so by here both branches are already finite.
       wd = f"nl.{self._npname(u.dtype)}"
       nonconst = u.src[2] if u.src[1].op is Ops.CONST else u.src[1]
       # both branches const (e.g. a relu mask: cond ? 1.0 : 0.0) -> the result shape IS the CONDITION's shape
       # (which may be a reduced (P,1), not the full (P,F) of the first input tile), so fill against the cond.
       sref = r(nonconst) if nonconst.op is not Ops.CONST else r(u.src[0])
-      def tile(s):
-        if s.op is Ops.CONST: return f"nl.full(({sref}).shape, {r(s)}, dtype={wd})"
-        e = r(s)
-        return f"nl.minimum(nl.maximum({e}, {-NL_BIG!r}), {NL_BIG!r})" if _has_div(s) else e
+      tile = lambda s: f"nl.full(({sref}).shape, {r(s)}, dtype={wd})" if s.op is Ops.CONST else r(s)
       return f"nl.where({r(u.src[0])}, {tile(u.src[1])}, {tile(u.src[2])})"
     if u.op is Ops.MULACC: return f"nl.add(nl.multiply({r(u.src[0])}, {r(u.src[1])}), {r(u.src[2])})"
     if u.op is Ops.EXP2: return f"nl.exp(nl.multiply({r(u.src[0])}, {LN2!r}))"
@@ -222,6 +206,25 @@ class NKIRenderer(Renderer):
     if u.op in NL_BOOL:   # boolean masks (xent one-hot) use logical_*; integer bitwise uses bitwise_*
       pre = "logical" if u.dtype == dtypes.bool else "bitwise"
       return f"nl.{pre}_{NL_BOOL[u.op]}({r(u.src[0])}, {r(u.src[1])})"
+    # DIVISION (reciprocal / x/y) -> CLAMP the result to a large finite range. nl.where is an arithmetic
+    # select (cond*x + (1-cond)*y), so any +-inf that reaches a multiply poisons it: reciprocal(0)=inf and
+    # then inf*0 = nan. tinygrad guards every divide-by-zero with a mask, so the inf is always a masked-out /
+    # don't-care position -- clamping reciprocal(0) to BIG (instead of inf) makes BIG*0 = 0, matching CPU's
+    # lazy select, while real divisions (result well within BIG) are untouched. Clamp at the SOURCE, not at the
+    # WHERE: the poisoning inf*0 forms INSIDE a branch (e.g. onehot * recip(count) * grad_out, grad_out gated
+    # to 0 at OOB), before the select, so a branch-level clamp would only see the already-formed nan.
+    if u.op in (Ops.RECIPROCAL, Ops.FDIV, Ops.CDIV):
+      d = f"nl.reciprocal({r(u.src[0])})" if u.op is Ops.RECIPROCAL else f"nl.divide({r(u.src[0])}, {r(u.src[1])})"
+      return f"nl.minimum(nl.maximum({d}, {-NL_BIG!r}), {NL_BIG!r})"
+    if u.op in (Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ):
+      # compare in float32. The HW compiler rejects an INTEGER tensor_scalar compare ("operand0 must be
+      # float32, got i32") -- which the xent-gradient one-hot hits (label index == class-coord). The operands
+      # are small indices/coords, exactly representable in fp32, so casting int->float preserves the result.
+      # A CONST operand becomes a float literal (e.g. bool True -> 1.0); a tile is nl.copy'd to float32.
+      def cmp(s):
+        if dtypes.is_float(s.dtype): return r(s)
+        return repr(float(s.arg)) if s.op is Ops.CONST else f"nl.copy({r(s)}, dtype=nl.float32)"
+      return f"{NL_BINOP[u.op]}({cmp(u.src[0])}, {cmp(u.src[1])})"
     if u.op in NL_BINOP: return f"{NL_BINOP[u.op]}({r(u.src[0])}, {r(u.src[1])})"
     if u.op in NL_UNOP:  return f"{NL_UNOP[u.op]}({r(u.src[0])})"
     raise NotImplementedError(f"NKI renderer: unhandled op {u.op}")
